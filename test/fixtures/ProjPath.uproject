@@ -1,0 +1,10 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "C:/Users/Luqman/Documents/pi-unreal/test/fixtures/EngineA",
+	"Modules": [
+		{
+			"Name": "P",
+			"Type": "Runtime"
+		}
+	]
+}

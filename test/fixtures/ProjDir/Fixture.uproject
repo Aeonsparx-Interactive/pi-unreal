@@ -1,0 +1,55 @@
+// JSONC fixture: comments, a trailing comma, and a key the engine does not serialize.
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "Testing",
+	"Description": "Fixture project",
+	"Modules": [
+		{ "Name": "Fixture", "Type": "Runtime", "LoadingPhase": "Default" },
+		{ "Name": "FixtureEditor", "Type": "Editor", "LoadingPhase": "Default", "AdditionalDependencies": ["UnrealEd"] },
+	],
+	"Plugins": [
+		{
+			"Name": "Alpha",
+			"Enabled": true
+		},
+		{
+			"Name": "Shared",
+			"Enabled": true
+		},
+		{
+			"Name": "Legacy",
+			"Enabled": true
+		},
+		{
+			"Name": "Beta",
+			"Enabled": true
+		},
+		{
+			"Name": "NoModules",
+			"Enabled": true
+		},
+		{
+			"Name": "Ghost",
+			"Optional": true,
+			"Enabled": true
+		},
+		{
+			"Name": "ModOnly",
+			"Enabled": true
+		},
+		{
+			"Name": "ExtraPlug",
+			"Enabled": true
+		},
+		{
+			"Name": "Alpha",
+			"Enabled": false
+		},
+	],
+	"TargetPlatforms": [ "Windows", "Android", ],
+	"AdditionalPluginDirectories": [
+		"C:/Users/Luqman/Documents/pi-unreal/test/fixtures/ProjDir/Extra"
+	],
+	"NotAnEngineField": true,
+}

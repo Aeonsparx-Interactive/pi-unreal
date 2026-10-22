@@ -1,0 +1,6 @@
+// Association is version-shaped; the user hint must outrank HKLM.
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Modules": [ { "Name": "H", "Type": "Runtime" }, ],
+}

@@ -1,0 +1,42 @@
+{
+  "name": "pi-unreal",
+  "version": "0.1.0",
+  "description": "Read-only Pi extension that resolves Unreal Engine associations and project/plugin descriptors from engine-authored schemas instead of guesswork.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "unreal-engine",
+    "pi-extension",
+    "uproject",
+    "uplugin"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/unreal/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  },
+  "dependencies": {
+    "fast-glob": "^3.3.3",
+    "jsonc-parser": "^3.3.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@types/node": "^24"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

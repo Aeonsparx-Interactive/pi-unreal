@@ -1,0 +1,11 @@
+{
+	"Name": "Legacy",
+	"FileVersion": 3,
+	"EngineVersion": "5.7.0-0+UE5",
+	"Modules": [
+		{
+			"Name": "LegacyMod",
+			"Type": "Runtime"
+		}
+	]
+}

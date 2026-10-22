@@ -1,0 +1,10 @@
+{
+	"Name": "ModOnly",
+	"FileVersion": 3,
+	"Modules": [
+		{
+			"Name": "ModOnly",
+			"Type": "Runtime"
+		}
+	]
+}

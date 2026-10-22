@@ -1,0 +1,10 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "9.9",
+	"Modules": [
+		{
+			"Name": "B",
+			"Type": "Runtime"
+		}
+	]
+}

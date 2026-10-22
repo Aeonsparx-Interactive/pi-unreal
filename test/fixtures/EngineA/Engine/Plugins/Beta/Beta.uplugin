@@ -1,0 +1,11 @@
+{
+	"Name": "Beta",
+	"FileVersion": 3,
+	"IsBetaVersion": true,
+	"Modules": [
+		{
+			"Name": "BetaMod",
+			"Type": "Runtime"
+		}
+	]
+}

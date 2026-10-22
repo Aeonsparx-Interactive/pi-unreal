@@ -1,0 +1,12 @@
+{
+	"Name": "Shared",
+	"FileVersion": 3,
+	"SemVersion": "2.0.0",
+	"EngineVersion": "5.8.0-0+UE5",
+	"Modules": [
+		{
+			"Name": "SharedRuntime",
+			"Type": "Runtime"
+		}
+	]
+}

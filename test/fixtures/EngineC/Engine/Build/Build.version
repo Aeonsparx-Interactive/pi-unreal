@@ -1,0 +1,14 @@
+{
+	"MajorVersion": 5,
+	"MinorVersion": 8,
+	"PatchVersion": 0,
+	"Changelist": 0,
+	"CompatibleChangelist": 47537391,
+	"BuildVersion": 1234,
+	"UserVisibleVersion": "1.0.0",
+	"BuildConfiguration": "Development",
+	"TargetType": "Editor",
+	"Platform": "Windows",
+	"CommitName": "Fixture",
+	"BranchName": "UE5"
+}

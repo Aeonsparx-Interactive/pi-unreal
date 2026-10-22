@@ -1,0 +1,10 @@
+{
+	"Name": "ExtraPlug",
+	"FileVersion": 3,
+	"Modules": [
+		{
+			"Name": "ExtraPlug",
+			"Type": "Runtime"
+		}
+	]
+}

@@ -1,0 +1,7 @@
+﻿{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Modules": [
+		{ "Name": "Bom", "Type": "Runtime", "LoadingPhase": "PostEngineInit" }
+	]
+}

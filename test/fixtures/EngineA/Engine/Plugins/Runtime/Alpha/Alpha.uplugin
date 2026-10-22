@@ -1,0 +1,15 @@
+{
+	"Name": "Alpha",
+	"FileVersion": 3,
+	"Version": 65536,
+	"SemVersion": "1.0.0",
+	"VersionName": "Release",
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "Alpha",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
