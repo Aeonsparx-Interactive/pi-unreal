@@ -1,0 +1,211 @@
+name: Release
+
+# Default-branch gate + staged npm publishing.
+#
+# Merging to master with a bumped `version` in package.json:
+#   1. runs `bun test` on Linux and Windows;
+#   2. pushes the immutable tag v<major>.<minor>.<patch>;
+#   3. creates the GitHub Release on a major/minor bump, updates the existing
+#      release for a patch bump (the release lives on the moving alias tag
+#      v<major>.<minor>, so "patch only updates the existing release" is possible);
+#   4. stages the tarball with `npm stage publish`.
+#
+# Nothing becomes public in this workflow. A human approves it later, from any
+# machine, with 2FA:
+#   npm stage list @aeonsparx/pi-unreal
+#   npm stage view <stage-id>
+#   npm stage approve <stage-id>
+#
+# Staged publishing needs npm >= 11.15.0 and Node >= 22.14.0, so the job installs
+# npm@12 explicitly: Node 22 ships npm 10.x, which has no `npm stage` command.
+# `NPM_TOKEN` is a Granular Access Token with Read+Write and *no* 2FA bypass -
+# tokens can stage, only the 2FA human act can publish.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - package.json
+      - extensions/**
+      - skills/**
+      - prompts/**
+      - tsconfig.json
+      - bun.lock
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # Reserved for `npm stage publish --provenance` (see the README runbook); v1 does not use it.
+  id-token: write
+
+concurrency:
+  group: release-master
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: bun test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test
+        run: bun test
+
+  stage:
+    name: Stage npm release
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      PKG: '@aeonsparx/pi-unreal'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: npm CLI with staged publishing
+        run: npm install -g npm@12
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Resolve release plan
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUB="$(npm view "$PKG" version 2>/dev/null || echo 0.0.0)"
+          echo "latest published version: $PUB"
+          PUB="$PUB" node -e '
+            const p = require("./package.json");
+            const np = String(p.version).split(".").map(Number);
+            const pub = String(process.env.PUB).split("-")[0].split(".").map(Number);
+            const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || (a[2] || 0) - (b[2] || 0);
+            const c = cmp(np, pub);
+            const out = {
+              version: np.join("."),
+              publishedVersion: pub.join("."),
+              published: c === 0,
+              backwards: c < 0,
+              line: np[0] + "." + np[1],
+              newLine: np[0] !== pub[0] || np[1] !== pub[1],
+            };
+            for (const [k, v] of Object.entries(out)) console.log(k + "=" + v);
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Report release plan
+        shell: bash
+        run: |
+          {
+            echo "## Release plan"
+            echo "- package: $PKG"
+            echo "- package.json version: ${{ steps.ver.outputs.version }}"
+            echo "- latest published version: ${{ steps.ver.outputs.publishedVersion }}"
+            echo "- release line: v${{ steps.ver.outputs.line }}"
+            echo "- major/minor bump (new line): ${{ steps.ver.outputs.newLine }}"
+            echo "- already published: ${{ steps.ver.outputs.published }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on version regression
+        if: steps.ver.outputs.backwards == 'true'
+        shell: bash
+        run: |
+          echo "::error::package.json version ${{ steps.ver.outputs.version }} is older than the published version ${{ steps.ver.outputs.publishedVersion }}. Bump it forward."
+          exit 1
+
+      - name: Nothing to do (version already published)
+        if: steps.ver.outputs.published == 'true'
+        shell: bash
+        run: |
+          echo "version ${{ steps.ver.outputs.version }} is already published - no tags, no release change, no staging."
+
+      - name: Generate release notes
+        if: steps.ver.outputs.published == 'false'
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PREV: ${{ steps.ver.outputs.publishedVersion }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/v${PREV}" >/dev/null; then
+            git log --no-merges --pretty=format:'- %s (%h)' "v${PREV}..HEAD" > notes.md
+          else
+            git log --no-merges --pretty=format:'- %s (%h)' -n 25 > notes.md
+          fi
+          if [ ! -s notes.md ]; then
+            printf -- '- v%s\n' "$VERSION" > notes.md
+          fi
+          cat notes.md
+
+      - name: Push release tag
+        if: steps.ver.outputs.published == 'false'
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "v${VERSION}"
+
+      # The release is identified by the moving alias tag v<major>.<minor>:
+      # a new line creates it, a patch on an existing line force-moves the alias and
+      # rewrites that release's title and notes. v<major>.<minor>.<patch> tags are
+      # never moved, so exact pins stay valid.
+      - name: Create or update GitHub Release
+        if: steps.ver.outputs.published == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          LINE: ${{ steps.ver.outputs.line }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if gh release view "v${LINE}" >/dev/null 2>&1; then
+            git tag -f "v${LINE}" -m "Release line v${LINE}"
+            git push --force origin "v${LINE}"
+            gh release edit "v${LINE}" --title "v${LINE} (v${VERSION})" --notes-file notes.md
+          else
+            git tag -a "v${LINE}" -m "Release line v${LINE}"
+            git push origin "v${LINE}"
+            gh release create "v${LINE}" --title "v${LINE} (v${VERSION})" --notes-file notes.md
+          fi
+
+      - name: Tarball dry run
+        if: steps.ver.outputs.published == 'false'
+        shell: bash
+        run: npm publish --dry-run
+
+      - name: Stage publish
+        if: steps.ver.outputs.published == 'false'
+        shell: bash
+        run: npm stage publish --access public
+
+      - name: Stage queue
+        shell: bash
+        run: npm stage list "$PKG" --json || true

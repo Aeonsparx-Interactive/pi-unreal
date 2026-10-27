@@ -1,10 +1,27 @@
 {
-  "name": "pi-unreal",
-  "version": "0.1.0",
+  "name": "@aeonsparx/pi-unreal",
+  "version": "1.0.0",
   "description": "Read-only Pi extension that resolves Unreal Engine associations and project/plugin descriptors from engine-authored schemas instead of guesswork.",
   "type": "module",
-  "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aeonsparx-Interactive/pi-unreal.git"
+  },
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "extensions/unreal",
+    "skills",
+    "prompts",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
   "keywords": [
     "pi-package",
     "unreal-engine",
@@ -29,7 +46,9 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^1.4.0",
-    "@types/node": "^24"
+    "@types/bun": "^1.4.3",
+    "@types/node": "^24",
+    "typescript": "^7.0.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

@@ -135,10 +135,46 @@ Because of that model:
   diagnostics are clangd's job when clangd is installed.
 - `.ini` provenance, live-coding state, and asset metadata are out of scope for v1.
 
-## Not published to npm yet
+## Install
 
-`pi-unreal` is not on npmjs. Install instructions will land with the first published release —
-until then, use it from a clone (see *Developers* below).
+Published as **`@aeonsparx/pi-unreal`** on npmjs.
+
+```bash
+pi install npm:@aeonsparx/pi-unreal@1.0.0                        # pinned version, reproducible
+pi install git:github.com/Aeonsparx-Interactive/pi-unreal@v1.0   # follows patch releases on the v1.0 line
+```
+
+The `npm:` route installs from the registry and pins an exact version. The `git:` route clones the
+repository and checks out the ref: a line alias (`@v1.0`) is a moving tag that patch releases
+force-move, so `pi` picks up patches on update; pin `@v1.0.2` for a fixed snapshot. Loading straight
+from a clone still works and needs no install: `pi -e ./extensions/unreal/index.ts`.
+
+## Releasing (maintainers)
+
+| `package.json` bump | GitHub Release | npmjs |
+| --- | --- | --- |
+| `major` / `minor` | **new** release `v<major>.<minor>` | staged `<major>.<minor>.<patch>` |
+| `patch` | **updates** the existing `v<major>.<minor>` release | staged `<major>.<minor>.<patch>` |
+
+Merge a PR that bumps `version` into `master`. `.github/workflows/release.yml` runs `bun test` on
+Linux and Windows, pushes the immutable tag `v<major>.<minor>.<patch>`, moves the `v<major>.<minor>`
+alias, creates or updates that release, then stages the tarball with `npm stage publish`. **Nothing
+is public until a human approves it** (2FA, from any machine):
+
+```bash
+npm stage list @aeonsparx/pi-unreal     # stage ids (no 2FA)
+npm stage view <stage-id>              # metadata
+npm stage download <stage-id>          # inspect the exact tarball that will publish
+npm stage approve <stage-id>           # 2FA - this is the publish act
+npm stage reject <stage-id>            # 2FA - frees the staged version number
+```
+
+The same queue is on npmjs.com (Staged Packages tab). `npm stage` requires npm >= 11.15.0
+(`npm install -g npm@12`) and Node >= 22.14.0. `NPM_TOKEN` (repository secret) is a Granular Access
+Token with Read+Write and **no** 2FA bypass: CI can stage, only you can publish. Staged versions
+occupy their version number, so a rejected stage burns `x.y.z` until `npm stage reject` frees it.
+Provenance is deliberately off in v1 (`--provenance` needs a Provenance-scope token, and the
+attestation path through stage-then-approve is unverified).
 
 ## Developers
 
