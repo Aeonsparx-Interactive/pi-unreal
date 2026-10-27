@@ -100,7 +100,8 @@ spending minutes on a scan nobody asked for. `unreal_index` is the explicit, pai
 Ranking inside `unreal_symbol`: exact (0) → qualified member (1) → prefix (2) → substring (3).
 Forward declarations rank last, so `unreal_symbol AActor` returns
 `Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h:282` (the `UCLASS` declaration), not
-the `class AActor;` line in `PhysicsCollision.h`. Engine areas are derived from module
+the `class AActor;` line in `PhysicsCollision.h`.
+`unreal_symbol LpGameModeBase` finds `ALpGameModeBase` (the UE prefix is added for you); `unreal_symbol FLpMovementDirectionThresholds:F` finds a single-letter `UPROPERTY` field; `unreal_context LpCharacterTypes.h` resolves a bare file name through the index. Engine areas are derived from module
 dependencies (`.uproject` modules → recursive `PublicDependencyModuleNames` → plugin-supplied
 modules → `Engine/Source/<area>/*`), so the index contains what this project can compile against,
 not the whole engine.
@@ -209,5 +210,3 @@ keys in real engine files so diagnostics stay honest.
   18,566 files; `Editor` and `Developer` are opt-in via `engineAreas` and roughly triple the scan.
 - Index reuse requires the *same root set*: an index built over two modules is never used to answer
   a `Runtime`-wide query. Partial coverage reported as an answer is worse than a rebuild.
-`unreal_symbol LpGameModeBase` finds `ALpGameModeBase` (the UE prefix is added for you), and
-`unreal_symbol FLpMovementDirectionThresholds:F` finds a single-letter `UPROPERTY` field.
