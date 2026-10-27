@@ -2,7 +2,7 @@ name: Release
 
 # Default-branch gate + staged npm publishing.
 #
-# Merging to master with a bumped `version` in package.json:
+# Merging to main with a bumped `version` in package.json:
 #   1. runs `bun test` on Linux and Windows;
 #   2. pushes the immutable tag v<major>.<minor>.<patch>;
 #   3. creates the GitHub Release on a major/minor bump, updates the existing
@@ -23,7 +23,7 @@ name: Release
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - package.json
       - extensions/**
@@ -39,7 +39,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: release-master
+  group: release-main
   cancel-in-progress: false
 
 jobs:

@@ -156,7 +156,7 @@ from a clone still works and needs no install: `pi -e ./extensions/unreal/index.
 | `major` / `minor` | **new** release `v<major>.<minor>` | staged `<major>.<minor>.<patch>` |
 | `patch` | **updates** the existing `v<major>.<minor>` release | staged `<major>.<minor>.<patch>` |
 
-Merge a PR that bumps `version` into `master`. `.github/workflows/release.yml` runs `bun test` on
+Merge a PR that bumps `version` into `main`. `.github/workflows/release.yml` runs `bun test` on
 Linux and Windows, pushes the immutable tag `v<major>.<minor>.<patch>`, moves the `v<major>.<minor>`
 alias, creates or updates that release, then stages the tarball with `npm stage publish`. **Nothing
 is public until a human approves it** (2FA, from any machine):
