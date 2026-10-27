@@ -27,6 +27,7 @@ import { parseUplugin, parseUproject, type EngineVersion, type UpluginDescriptor
 import { enumerateInstallations, resolveEngineForProject, findProjectFile, type EngineResolution, type ResolutionStatus } from "./lib/engine-resolver.ts";
 import { buildPluginIndex, computeScanDirs, resolveProjectPlugins, type PluginIndex, type PluginReferenceResult } from "./lib/plugin-resolver.ts";
 import { createWindowsRegistryReader, type RegistryReader } from "./lib/registry.ts";
+import { indexTools, unrealModuleCommand, unrealSymbolCommand } from "./lib/pi-tools.ts";
 import { joinPath, normalizePath, parentDir, realFs, truncateLines, type JsonValue } from "./lib/util.ts";
 
 /* ──────────────────────────────────────────────────────────────────────────── session state */
@@ -602,6 +603,35 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool(resolveEngineTool);
 	pi.registerTool(projectInspectTool);
 	pi.registerTool(pluginInspectTool);
+	for (const tool of indexTools) pi.registerTool(tool);
+
+	pi.registerCommand("unreal-symbol", {
+		description: "Where is this UE symbol defined? (project + plugins, then engine if an engine index exists)",
+		async handler(query: string, ctx: ExtensionCommandContext) {
+			const term = query.trim();
+			if (!term) {
+				ctx.ui.notify("usage: /unreal-symbol <symbol>  (qualified works: AActor:Tick)", "info");
+				return;
+			}
+			ctx.ui.notify("indexing / looking up…", "info");
+			const text = await unrealSymbolCommand(term, ctx.cwd);
+			ctx.ui.notify(truncateLines(text, 40).text, "info");
+		},
+	});
+
+	pi.registerCommand("unreal-module", {
+		description: "Module directory, dependency lists, defines file, standard and SDK (from UnrealBuildTool Query)",
+		async handler(name: string, ctx: ExtensionCommandContext) {
+			const module = name.trim();
+			if (!module) {
+				ctx.ui.notify("usage: /unreal-module <ModuleName>", "info");
+				return;
+			}
+			ctx.ui.notify("running UnrealBuildTool Query (cached after the first run)…", "info");
+			const text = await unrealModuleCommand(module, ctx.cwd);
+			ctx.ui.notify(truncateLines(text, 40).text, "info");
+		},
+	});
 
 	pi.registerCommand("unreal", {
 		description: "Inspect the Unreal Engine project for this directory (engine, modules, plugins)",

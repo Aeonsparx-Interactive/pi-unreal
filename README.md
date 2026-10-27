@@ -26,11 +26,15 @@ are peer dependencies and are never bundled.
 | `unreal_resolve_engine` | "which engine does this `.uproject` use, and how do you know?" |
 | `unreal_project_inspect` | modules, plugin references and their real resolution, JSONC diagnostics, `TargetPlatforms`, `AdditionalPluginDirectories` |
 | `unreal_plugin_inspect` | one `.uplugin` as the engine parses it, plus its declared plugin dependencies |
+| `unreal_symbol` | "where is this class/function/property/delegate declared?" — file, line, module |
+| `unreal_context` | "what does this file/module include, define, and own?" — real `Definitions.*.h` defines |
+| `unreal_index` | build, refresh, patch, inspect; `includePaths` and `moduleRefs` from UnrealBuildTool |
 
-All three are read-only, idempotent, and accept `project` (file or directory; defaults to the
-nearest `.uproject` within 4 levels of the workspace) and `engineRootHint` (disambiguates an
-ambiguous association). Each returns `structuredContent` for machine use and a text report for
-the model.
+All seven are read-only and idempotent. The three inspection tools accept `project` (file or
+directory; defaults to the nearest `.uproject` within 4 levels of the workspace) and
+`engineRootHint` (disambiguates an ambiguous association); the three index tools accept `cwd`
+(defaults to the workspace) plus a scope. Each returns `structuredContent` for machine use and a
+text report for the model.
 
 ### Commands
 
@@ -38,6 +42,8 @@ the model.
 - `/unreal-engines` — every engine installation this machine can prove, with how it was found
 - `/unreal-cache stats|clear` — plugin-index cache inspection (cache dir:
   `$PI_UNREAL_CACHE_DIR` or `~/.pi/agent/unreal-cache`)
+- `/unreal-symbol <query> [scope]` — shorthand for `unreal_symbol` (scope `project` default,
+  `engine`/`all` opt-in)
 
 ### Context card
 
@@ -57,6 +63,54 @@ messages, and never replaces the system prompt (cache stability; the machine-lev
 
 `*.cs` is deliberately excluded from the C++ warning: UBT build scripts are C#, not live-compiled
 engine source.
+
+## Symbol index (no compiler, no IDE)
+
+`unreal_symbol`, `unreal_context`, and `unreal_index` answer navigation questions from two
+compiler-free sources:
+
+1. **UnrealBuildTool Query** (`-Mode=Query`: `TargetDetails`, `TargetModuleReferences`) — the
+   engine's own record of targets, modules, module dependencies, include paths, and forced
+   includes. Measured on UE 5.8: 6.0 s for 1,079 modules, 2.1 s for the dependency graph, and it
+   needs no compiler. That is why MSVC-only machines (Visual Studio, Rider) are first class here:
+   Visual Studio's `Browse.VC.db` is encrypted with no public API, Rider's resolver is in-process
+   through RiderLink, and both derive their context from the same UBT rules this layer reads.
+2. **A regex definition scanner** over the project, its enabled plugins, and the engine areas its
+   modules actually depend on — `class`/`struct`/`enum`/`union`, `UFUNCTION`, `UPROPERTY`,
+   delegates, aliases, with `Owner:Member` qualified names and forward declarations marked.
+
+Artifacts live in `$PI_UNREAL_CACHE_DIR/indexes/<key>/` (`meta.json`, `defs.tsv`, `files.tsv`,
+plus `includes.tsv` in `full` mode): plain TSV — greppable, inspectable, shared across sessions
+and projects — and never inside the project tree or the engine installation.
+
+Measured on this box (UE 5.8.3 installed engine; Lp project with 25 enabled plugins):
+
+| Scope | Files | Definitions | Cold build |
+| --- | --- | --- | --- |
+| Project + plugins | 2,405 | 38,901 | 6.7 s |
+| Engine `Runtime` (shipped default: 279 module roots) | 18,566 | 436,729 | 57.6 s cold, 5.7 s warm |
+| Engine `Runtime/Core` + `Runtime/CoreUObject` | 3,094 | 70,548 | 16 s |
+| Cached lookup | — | — | ~0.3 s |
+
+Cost discipline is the design. A lookup builds the project index (seconds) and uses an engine
+index only if one exists; `scope: "engine"` on a cold machine returns
+`engine index not built — build it with unreal_index (action: "build", scope: "engine")` instead of
+spending minutes on a scan nobody asked for. `unreal_index` is the explicit, paid path.
+
+Ranking inside `unreal_symbol`: exact (0) → qualified member (1) → prefix (2) → substring (3).
+Forward declarations rank last, so `unreal_symbol AActor` returns
+`Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h:1439` (the `UCLASS` declaration), not
+the `class AActor;` line in `PhysicsCollision.h`. Engine areas are derived from module
+dependencies (`.uproject` modules → recursive `PublicDependencyModuleNames` → plugin-supplied
+modules → `Engine/Source/<area>/*`), so the index contains what this project can compile against,
+not the whole engine.
+
+One engine fact worth knowing: UBT Query reports `"defines": []` for every module. The effective
+preprocessor set lives in a forced include —
+`Intermediate/Build/<Platform>/<Config>/<Target>/Development/<Module>/Definitions.<Module>.h` —
+and `unreal_context` reads that file instead of guessing `WITH_*` values. Query is also never
+run with `-NoIntellisense`: that flag produces a syntactically valid skeleton with an empty
+`moduleToCompileSettings`, and `payloadOk()` rejects it.
 
 ## How engine resolution works
 
@@ -119,10 +173,13 @@ Field names, host types, and loading phases are transcribed from the engine's se
 ## Verify
 
 ```bash
-bun test                      # 41 tests: resolver, descriptors, plugins, cache, gate
+bun test                      # 57 tests: resolver, descriptors, plugins, cache, gate, scanner, index
 bun run typecheck             # tsc --noEmit
 bun test/live-check.ts "C:/path/to/Project.uproject"   # live machine smoke
 bun test/keys.census.mjs "C:/Program Files/Epic Games/UE_5.8/Engine/Plugins"
+bun run tmp/smoke.mjs project "C:/path/to/Project"     # symbol index against a real project
+bun run tmp/smoke.mjs query "C:/path/to/Project"       # UnrealBuildTool Query round trip
+bun run tmp/smoke.mjs engine "C:/path/to/Project"      # Engine/Source index (minutes, opt-in)
 ```
 
 `test/live-check.ts` prints the real resolution for a real project, the installation table, a
@@ -136,5 +193,19 @@ keys in real engine files so diagnostics stay honest.
 - `unreal_resolve_engine` reports what the machine can prove. It does not install, register, or
   migrate engines, and never writes registry keys (the engine's `RegisterEngineInstallation`
   does; this package deliberately does not).
-- v1 is inspection only. `.Build.cs` module graphs, declaration lookup, and `.ini` provenance
-  are deliberately out of scope.
+- v1 is inspection only. `.ini` provenance is out of scope.
+- The definition index is a scanner, not a parser: it finds declarations (`class`, `struct`,
+  `enum`, `union`, `UFUNCTION`/`UPROPERTY`/`UCLASS`-marked members, delegates, aliases) and
+  records `Owner:Member` qualified names. It does not resolve types, overloads, call sites, or
+  inheritance — that is what clangd is for when it is installed. Macro-heavy code can still be
+  misread: the scanner is regex-based, so a definition hidden inside an unusual macro spelling may
+  be missed, and `#if` branches are all recorded (a symbol declared in a disabled branch is a
+  candidate, not a guarantee).
+- `moduleRefs` and `includePaths` come from UnrealBuildTool Query, which needs a buildable
+  target for the project; when Query fails the index still builds and says so.
+- The engine index is never built implicitly: scans are opt-in through `unreal_index`.
+- Engine area selection is a cost dial, not a completeness claim. `DEFAULT_ENGINE_AREAS =
+  ["Runtime"]` covers every gameplay type (`AActor`, `UAnimInstance`, `USceneComponent`) at
+  18,566 files; `Editor` and `Developer` are opt-in via `engineAreas` and roughly triple the scan.
+- Index reuse requires the *same root set*: an index built over two modules is never used to answer
+  a `Runtime`-wide query. Partial coverage reported as an answer is worse than a rebuild.

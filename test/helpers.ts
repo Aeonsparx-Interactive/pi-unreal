@@ -36,10 +36,15 @@ export function memoryFs(files: Record<string, string>): FsAdapter {
 		},
 		listDir(path: string): string[] {
 			const dir = normalizePath(path);
-			return [...map.keys()]
+			const files = [...map.keys()]
 				.filter((key) => normalizePath(dirname(key)) === dir)
 				.map((key) => key.slice(dir.length + 1))
 				.filter((name) => !name.includes("/"));
+			// Directories are derived too: a walker that descends must see them, not only files.
+			const children = [...dirs]
+				.filter((candidate) => candidate.startsWith(`${dir}/`) && !candidate.slice(dir.length + 1).includes("/"))
+				.map((candidate) => candidate.slice(dir.length + 1));
+			return [...new Set([...files, ...children])];
 		},
 	};
 }

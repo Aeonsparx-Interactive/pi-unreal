@@ -35,13 +35,21 @@ function stubApi(record: Recorded) {
 test("registers the three Unreal tools", () => {
 	const record: Recorded = { tools: [], commands: [], handlers: [] };
 	extension(stubApi(record));
-	expect(record.tools.sort()).toEqual(["unreal_plugin_inspect", "unreal_project_inspect", "unreal_resolve_engine"]);
+	expect(record.tools.sort()).toEqual([
+		"unreal_context",
+		"unreal_index",
+		"unreal_plugin_inspect",
+		"unreal_project_inspect",
+		"unreal_resolve_engine",
+		"unreal_symbol",
+		"unreal_symbol_list",
+	]);
 });
 
 test("registers the commands and the session/agent/gate handlers", () => {
 	const record: Recorded = { tools: [], commands: [], handlers: [] };
 	extension(stubApi(record));
-	expect(record.commands.sort()).toEqual(["/unreal", "/unreal-cache", "/unreal-engines"]);
+	expect(record.commands.sort()).toEqual(["/unreal", "/unreal-cache", "/unreal-engines", "/unreal-module", "/unreal-symbol"]);
 	expect(record.handlers).toContain("tool_call");
 	expect(record.handlers).toContain("before_agent_start");
 	expect(record.handlers).toContain("session_start");
@@ -55,7 +63,7 @@ test("every tool declares a read-only annotation and an output schema", () => {
 		on: () => undefined,
 	} as never;
 	extension(api);
-	expect(registered.length).toBe(3);
+	expect(registered.length).toBe(7);
 	for (const tool of registered) {
 		expect(tool.annotations?.readOnlyHint).toBe(true);
 		expect(tool.annotations?.destructiveHint).toBe(false);
