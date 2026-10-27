@@ -172,7 +172,10 @@ export function scanText(text: string, file: string, module: string, scope: Symb
 
 	const emit = (symbol: string, kind: DefKind, line: number, marker: string) => {
 		const raw = symbol.replace(/<[\s\S]*$/, "").trim();
-		if (raw.length < 2) return;
+		// Single-character members are real UE (`double F = 0.0;` in LpCharacterTypes.h:94 is the
+		// forward angle bound). The length guard exists to drop macro noise, so it must not apply to
+		// the kinds that legitimately have one-letter names.
+		if (raw.length < 2 && kind !== "property" && kind !== "function") return;
 		if (/^[A-Z][A-Z0-9_]*_API$/.test(raw)) return; // `class ENGINE_API Foo` -> the macro is not a name
 		if (/[(),<>]/.test(raw)) return;
 		const owner = kind === "function" || kind === "property" ? innerType() : "";

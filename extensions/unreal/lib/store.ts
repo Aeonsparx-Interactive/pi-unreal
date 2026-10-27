@@ -29,7 +29,7 @@ import { normalizePath, joinPath, shortHash, baseName, realFs, type FsAdapter } 
 import { collectSourceFiles, scanText, type IncludeRef, type ScanRoot, type SymbolDef } from "./scan.ts";
 import { parseModuleReferences, parseTargetDetails, readQueryJson, type UbtModuleRefs, type UbtModuleSettings } from "./ubt.ts";
 
-export const INDEX_VERSION = 4;
+export const INDEX_VERSION = 5;
 
 /**
  * Default engine scan. `Runtime` is where gameplay types live (AActor, UAnimInstance,

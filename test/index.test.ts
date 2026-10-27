@@ -92,6 +92,21 @@ describe("definition scanner", () => {
 		expect(named(defs).some((symbol) => symbol.includes("<"))).toBe(false);
 	});
 
+	it("keeps one-character member names (FVector2D::X style fields)", () => {
+		expect(named(defs)).toContain("UTestCharacterSettings:MaxLives");
+		const { defs: tight } = scanText(String.raw`USTRUCT()
+struct TESTGAME_API FVec2
+{
+	UPROPERTY()
+	double X = 0.0;
+	UPROPERTY()
+	double Y = 0.0;
+};
+`, `${MODULE}/Public/Vec2.h`, "TestGame", "Project");
+		expect(tight.map((def) => def.symbol)).toContain("FVec2:X");
+		expect(tight.map((def) => def.symbol)).toContain("FVec2:Y");
+	});
+
 	it("marks forward declarations so they can rank below real declarations", () => {
 		const forward = defs.find((def) => def.symbol === "UBaseSettings");
 		expect(forward?.marker).toContain("forward");
