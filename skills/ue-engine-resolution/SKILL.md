@@ -67,6 +67,24 @@ shadowing earlier ones on name collision. Use the reported status (`resolved`, `
 `disabled`, `version-warning`, `shadowed`, `no-modules`) instead of assuming a plugin is
 available. `Binaries/`, `Intermediate/`, `Saved/`, and `ThirdParty/` are never scanned.
 
+## After resolution: where declarations and build context come from
+
+`unreal_resolve_engine` answers *which engine*. The rest of the navigation questions are answered
+by the index tools, and they use the resolved root — a wrong engine root means a wrong index:
+
+- `unreal_symbol` — declaration site + owning module for a type, function, `UPROPERTY`, delegate.
+  Engine scope is opt-in (`scope: "engine"`) and its areas come from
+  `PublicDependencyModuleNames` in the modules under `Engine/Source/<area>`, so the scan follows
+  what the project actually depends on.
+- `unreal_context` — include paths, C++ standard, compiler, the real `WITH_*` defines read from
+  `Definitions.<Module>.h`, and the module's public/private dependency lists.
+- `unreal_index` — build/refresh/patch/status, `moduleRefs` for the dependency graph, and the
+  UnrealBuildTool `-Mode=Query` cache underneath.
+
+No compiler, no IDE database, nothing written inside the project: the index lives in
+`~/.pi/agent/unreal-cache` (`$PI_UNREAL_CACHE_DIR`). clangd stays the authority for references,
+overrides, and diagnostics — see `ue-symbol-navigation` in a UE project's `.agents/skills/`.
+
 ## Conventions this package enforces
 
 - `.uasset` and `.umap` are cooked binary — author them in the running editor, never by editing
