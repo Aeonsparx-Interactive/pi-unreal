@@ -525,6 +525,18 @@ export function listModules(index: IndexState, options: { limit?: number } = {})
 }
 
 /** Files of a module, public headers first — "what does module X expose". */
+/**
+ * Resolve a partial path (`LpCharacterTypes.h`, `Public/Character/LpCharacterTypes.h`) against the
+ * indexed files. Agents pass what they see in an error message, not an absolute path.
+ */
+export function findFileBySuffix(index: IndexState, suffix: string, limit = 6): string[] {
+	const want = normalizePath(suffix).toLowerCase();
+	return readFileRows(index)
+		.filter((row) => row.file.toLowerCase().endsWith(want) || row.file.toLowerCase().includes("/" + want))
+		.slice(0, limit)
+		.map((row) => row.file);
+}
+
 export function listFiles(index: IndexState, module: string, options: { kind?: string; limit?: number } = {}): { file: string; module: string; kind: string; symbols: number }[] {
 	const rows = readFileRows(index);
 	const limit = options.limit ?? 300;

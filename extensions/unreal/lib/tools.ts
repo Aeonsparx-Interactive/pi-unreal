@@ -20,6 +20,7 @@ import {
 	assembleRoots,
 	buildIndex,
 	contextFor,
+	findFileBySuffix,
 	indexKeyFor,
 	listFiles,
 	listIndexes,
@@ -241,7 +242,9 @@ export async function symbolLookup(input: SymbolLookupInput) {
 		else notes.push("engine index not built — pass scope 'engine' or 'all' for engine symbols (first build takes minutes)");
 	}
 
-	results.sort((a, b) => a.kind.localeCompare(b.kind) || a.symbol.localeCompare(b.symbol));
+	// Rank first, kind second: sorting by kind/name is what made a plugin forward declaration beat
+	// the engine's real `UCLASS` row and then get cut by the limit.
+	results.sort((a, b) => a.rank - b.rank || Number(b.marker.includes("forward")) - Number(a.marker.includes("forward")) || a.kind.localeCompare(b.kind) || a.symbol.localeCompare(b.symbol));
 	return { query: input.query, scope, total: results.length, results: results.slice(0, limit), indexes, notes, warnings, workspace: { projectPath: workspace.projectPath, engineRoot: workspace.engineRoot } };
 }
 
@@ -300,7 +303,18 @@ export async function fileContext(input: FileContextInput) {
 	const warnings: string[] = [];
 	const workspace = await resolveWorkspace(input.cwd, fs, input.deps);
 	let mode: Mode = input.mode ?? "definitions";
-	const file = normalizePath(input.file);
+	let file = normalizePath(input.file);
+	if (!/^([a-z]:)?[\/]/i.test(file)) {
+		for (const base of [input.cwd, workspace.projectDir]) {
+			if (!base) continue;
+			const candidate = normalizePath(joinPath(base, file));
+			if (fs.exists(candidate)) {
+				notes.push(`resolved relative path to ${candidate}`);
+				file = candidate;
+				break;
+			}
+		}
+	}
 
 	let queryFiles: CachePaths | undefined;
 	let choice: TargetChoice | undefined;
@@ -322,7 +336,18 @@ export async function fileContext(input: FileContextInput) {
 	warnings.push(...handle.warnings);
 	if (!handle.index) return { file, mode, notes, warnings, error: `no index available for ${scope} sources` };
 
-	const context = contextFor(handle.index, file, { limit: input.limit ?? 40, queryFiles: queryFiles ?? handle.index.meta.queryFiles });
+	let context = contextFor(handle.index, file, { limit: input.limit ?? 40, queryFiles: queryFiles ?? handle.index.meta.queryFiles });
+	if (!context) {
+		// A bare file name is the common case; resolve it against what the index actually holds.
+		const matches = findFileBySuffix(handle.index, baseName(file), 6);
+		if (matches.length === 1) {
+			file = matches[0]!;
+			notes.push(`resolved '${input.file}' to ${file} via the index`);
+			context = contextFor(handle.index, file, { limit: input.limit ?? 40, queryFiles: queryFiles ?? handle.index.meta.queryFiles });
+		} else if (matches.length > 1) {
+			return { file, mode, notes: [...notes, `multiple indexed files match '${baseName(file)}': ${matches.join(", ")}`], warnings, error: "ambiguous file name; pass a path with more directories" };
+		}
+	}
 	if (!context) {
 		const other = mode === "full" ? "definitions" : "full";
 		const fallback = pickIndex({ mode: other as Mode, projectRoot: workspace.projectDir, engineRoot: workspace.engineRoot }).index;
@@ -338,6 +363,7 @@ export async function fileContext(input: FileContextInput) {
 
 	const symbols = symbolsInFile(handle.index, file, input.limit ?? 40);
 	const defines = input.includeDefines ? context.defines : undefined;
+	if (!context.includePaths?.length) notes.push("no include paths in this mode — build mode 'full' (unreal_index, mode: \"full\") for includePaths and the forced-included defines file");
 	notes.push(`module attribution: ${handle.index.meta.source === "ubt" ? "UnrealBuildTool Query dirToModule" : "*.Build.cs location (run a full-mode index for UBT's own answer)"}`);
 	return {
 		file,
@@ -398,6 +424,7 @@ export async function buildContext(input: BuildContextInput) {
 	else if (!settings) notes.push(`module '${wanted}' has module references but no compile settings entry in TargetDetails`);
 
 	const headers = refs ? [...refs.public, ...refs.private, ...refs.publicInclude, ...refs.privateInclude] : [];
+	if (refs && !settings) notes.push("compile settings (includePaths, standard, forced includes) live in TargetDetails; this target's TargetDetails entry for the module was empty");
 	const handle = await ensureIndex({ workspace, mode: "definitions", scope: "project", engineAreas: input.engineAreas, fs });
 	const indexModules = handle.index ? listModules(handle.index, { limit: input.limit ?? 40 }) : [];
 
