@@ -1,218 +1,146 @@
 # pi-unreal
 
-Pi package that replaces Unreal Engine guesswork with facts the engine itself defines: which
-engine installation a `.uproject` points at, what its `.uproject` / `.uplugin` descriptors
-actually say, and where each plugin reference really resolves.
+**Unreal Engine awareness for the Pi coding agent.**
 
-Read-only by design. It never writes to a project, never touches the registry, and blocks the
-three edits that damage Unreal work on this machine.
+Open a UE project in a `pi` session and the agent stops guessing. It knows which engine
+installation that `.uproject` really resolves to, what the `.uproject` / `.uplugin` files actually
+say, which plugins exist on disk, and where a C++ symbol is declared — with the file, the line and
+the owning module. No compiler, no Visual Studio, no Rider, no clangd required.
 
-## Install
+It is **read-only**: it never writes to your project, never touches the Windows registry, never
+launches the editor, and blocks three kinds of edit that damage Unreal work.
 
-```bash
-pi install ./pi-unreal      # from this directory
-pi -e ./extensions/unreal/index.ts   # dev loop, no install
+## What you get in a session
+
+**Context is detected for you.** When the session starts in a directory that contains a
+`.uproject` — the working directory itself, or any of up to 3 parent directories — one note is
+shown before the first answer: the resolved engine root and version, installed vs source build,
+the project's modules, the number of declared plugin references, and the conventions below. Ask
+for a re-check any time with `/unreal`.
+
+**Ask in plain English.** "Which engine is this project on?", "Is MassGameplay available to this
+project?", "Where is `FLpMovementDirectionThresholds` defined?", "What do I need to link to use
+`UAnimInstance`?" The agent picks the matching tool:
+
+| Tool | Question it answers |
+| --- | --- |
+| `unreal_resolve_engine` | "Which engine does this `.uproject` use — and how do you know?" |
+| `unreal_project_inspect` | Modules, target platforms, and every plugin reference resolved against the plugins that exist on disk |
+| `unreal_plugin_inspect` | One `.uplugin` as the engine parses it: modules, loading phases, version fields, plugin dependencies |
+| `unreal_symbol` | "Where is this class / struct / function / `UPROPERTY` / delegate declared?" One line per hit: kind, file:line, module |
+| `unreal_symbol_list` | "What does this project define?" Names by prefix — `ULp`, `ANiMy`, `UAnim` |
+| `unreal_context` | "What does this file/module include, define, and depend on?" Include paths, dependency lists, the real `WITH_*` defines |
+| `unreal_index` | Builds and reports the source index, and the clangd compile database on request |
+
+**Slash commands you can type yourself:**
+
+| Command | Result |
+| --- | --- |
+| `/unreal [project]` | Engine, modules and plugin-reference report for this directory |
+| `/unreal-engines` | Every engine installation this machine can prove, and how each was found |
+| `/unreal-symbol <symbol>` | Definition lookup, project + plugins, then engine if an engine index exists |
+| `/unreal-module <Module>` | Module directory, public/private dependency lists, defines file, C++ standard, SDK |
+| `/unreal-cache stats\|clear` | Inspect or clear the cached indexes |
+
+Example — `/unreal`:
+
+```text
+project  C:/Work/Lp/Lp.uproject
+engine: C:/Program Files/Epic Games/UE_5.8
+  version 5.8.3 | installed build | association "5.8" (version) via dir-scan
+  Build.version: C:/Program Files/Epic Games/UE_5.8/Engine/Build/Build.version
+modules: Lp (Runtime), LpEditor (Editor)
+plugins declared: 25
+plugin index: 897 .uplugin (cache hit)
+plugin references:
+  MassGameplay: resolved ← Engine
+  ModularGameplay: resolved ← Engine
+  SomeLocalPlugin: resolved ← Project
+  RetiredPlugin: missing
+  totals: 22 resolved, 3 missing of 25 references
 ```
 
-Dependencies (`fast-glob`, `jsonc-parser`) install with the package. The Pi host and `typebox`
-are peer dependencies and are never bundled.
+Example — `unreal_symbol` for an engine type (engine index already built):
 
-## What it gives the agent
+```text
+unreal_symbol 'AActor' scope=engine: 1 definition(s)
+  class AActor  C:/Program Files/Epic Games/UE_5.8/Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h:282  [Engine · engine]
+```
 
-### Tools
+That is a definition line, not a grep dump: grepping a hot engine class name returns ~176 files of
+noise, which is exactly what burns a session's context.
 
-| Tool | Answers |
+## Guardrails (automatic, nothing to enable)
+
+| Situation | What happens |
 | --- | --- |
-| `unreal_resolve_engine` | "which engine does this `.uproject` use, and how do you know?" |
-| `unreal_project_inspect` | modules, plugin references and their real resolution, JSONC diagnostics, `TargetPlatforms`, `AdditionalPluginDirectories` |
-| `unreal_plugin_inspect` | one `.uplugin` as the engine parses it, plus its declared plugin dependencies |
-| `unreal_symbol` | "where is this class/function/property/delegate declared?" — file, line, module |
-| `unreal_context` | "what does this file/module include, define, and own?" — real `Definitions.*.h` defines |
-| `unreal_index` | build, refresh, patch, inspect; `includePaths` and `moduleRefs` from UnrealBuildTool; `action: "compiledb"` for the clangd database |
+| An edit targeting `*.uasset` / `*.umap` | **Blocked** — those are cooked binary assets; author them in the running editor |
+| A C++ edit while `UnrealEditor` is running | **Warning** — freshly compiled C++ will not load into a running editor; close it, then build |
+| `clang-format` aimed at a `*.cs` file | **Blocked** — clang-format applies the C# rule and can empty the file |
 
-All seven are read-only and idempotent. The three inspection tools accept `project` (file or
-directory; defaults to the nearest `.uproject` within 4 levels of the workspace) and
-`engineRootHint` (disambiguates an ambiguous association); the three index tools accept `cwd`
-(defaults to the workspace) plus a scope. Each returns `structuredContent` for machine use and a
-text report for the model.
+## Costs: what is fast, and what is opt-in
 
-### Commands
-
-- `/unreal [project]` — engine resolution + descriptor + plugin-reference report
-- `/unreal-engines` — every engine installation this machine can prove, with how it was found
-- `/unreal-cache stats|clear` — plugin-index cache inspection (cache dir:
-  `$PI_UNREAL_CACHE_DIR` or `~/.pi/agent/unreal-cache`)
-- `/unreal-symbol <query> [scope]` — shorthand for `unreal_symbol` (scope `project` default,
-  `engine`/`all` opt-in)
-
-### Context card
-
-On the first user prompt of a session, when a `.uproject` is discoverable from the working
-directory, one `unreal:context` message states the resolved engine, modules, plugin-reference
-count, and the conventions below. It is injected once per session, is skipped for custom
-messages, and never replaces the system prompt (cache stability; the machine-level
-`AGENTS.md` stays in charge).
-
-### Convention gate
-
-| Situation | Action |
+| Operation | Time |
 | --- | --- |
-| `edit` / `write` targeting `*.uasset` / `*.umap` | **blocked** — cooked binary, author it in the editor |
-| `edit` on C++ (`*.cpp`, `*.h`, …) while `UnrealEditor*` runs | **warning** — freshly compiled C++ will not load into the running editor |
-| `bash` / `powershell` running `clang-format` against a `*.cs` file | **blocked** — clang-format applies the C# rule and can empty the file (verified on `Source/Lp.Target.cs`) |
+| Cached lookup (symbol, project facts) | ~0.3 s |
+| First project/plugin index (≈2,400 files) | seconds |
+| Engine `Runtime` index — cold | ~1 minute |
+| Engine `Runtime` index — warm | ~6 s |
+| UnrealBuildTool Query facts | ~7 s, then cached |
+| clangd compile database (`unreal_index` → `compiledb`) | minutes, ~1 GB for the engine scope |
 
-`*.cs` is deliberately excluded from the C++ warning: UBT build scripts are C#, not live-compiled
-engine source.
+Because of that model:
 
-## Symbol index (no compiler, no IDE)
+- Symbol lookups never stall. If a question needs engine sources and no engine index exists, the
+  agent reports the cost and how to pay it, and asks you. Say **yes** once per machine —
+  `/unreal-cache stats` shows what you have. Engine scans default to `engineAreas: ["Runtime"]`,
+  which is enough for gameplay base classes (`AActor`, `UAnimInstance`, `USceneComponent`);
+  `Editor` and `Developer` are opt-in and roughly triple the scan.
+- Ask for `unreal_index` with `action: "build"`, `scope: "engine"` when you want engine-wide
+  navigation, and `action: "compiledb"` when you want clangd's references/call hierarchy.
+- After a branch switch, a rebase, adding a plugin, or an engine version change, say "rebuild the
+  Unreal index" (that is `refresh: true`).
+- Everything lives in `~/.pi/agent/unreal-cache` (override with `$PI_UNREAL_CACHE_DIR`) — never
+  inside your project tree or your engine installation. The compile database encodes this
+  machine's absolute paths, so it is machine-local by design.
 
-`unreal_symbol`, `unreal_context`, and `unreal_index` answer navigation questions from two
-compiler-free sources:
+## Requirements
 
-1. **UnrealBuildTool Query** (`-Mode=Query`: `TargetDetails`, `TargetModuleReferences`) — the
-   engine's own record of targets, modules, module dependencies, include paths, and forced
-   includes. Measured on UE 5.8: 6.0 s for 1,079 modules, 2.1 s for the dependency graph, and it
-   needs no compiler. That is why MSVC-only machines (Visual Studio, Rider) are first class here:
-   Visual Studio's `Browse.VC.db` is encrypted with no public API, Rider's resolver is in-process
-   through RiderLink, and both derive their context from the same UBT rules this layer reads.
-2. **A regex definition scanner** over the project, its enabled plugins, and the engine areas its
-   modules actually depend on — `class`/`struct`/`enum`/`union`, `UFUNCTION`, `UPROPERTY`,
-   delegates, aliases, with `Owner:Member` qualified names and forward declarations marked.
+- **Windows**, with **PowerShell 7** (`pwsh`) for registry-based engine discovery. Without it the
+  extension still works: resolution falls back to `UNREAL_ENGINE` / `UE_ROOT` /
+  `PI_UNREAL_ENGINE_ROOT`, the Launcher's install list, and a scan of
+  `C:/Program Files/Epic Games`.
+- An Unreal Engine installation the project can resolve to (Launcher install or source build).
+  Descriptor field handling is transcribed from UE 5.8.
+- Nothing else. No compiler, no IDE language service. clangd is optional enrichment for
+  `compiledb` and the `clangd --check` acceptance step.
 
-Artifacts live in `$PI_UNREAL_CACHE_DIR/indexes/<key>/` (`meta.json`, `defs.tsv`, `files.tsv`,
-plus `includes.tsv` in `full` mode): plain TSV — greppable, inspectable, shared across sessions
-and projects — and never inside the project tree or the engine installation.
+## Troubleshooting
 
-Measured on this box (UE 5.8.3 installed engine; Lp project with 25 enabled plugins):
-
-| Scope | Files | Definitions | Cold build |
-| --- | --- | --- | --- |
-| Project + plugins | 2,405 | 38,901 | 6.7 s |
-| Engine `Runtime` (shipped default: 279 module roots) | 18,566 | 436,729 | 57.6 s cold, 5.7 s warm |
-| Engine `Runtime/Core` + `Runtime/CoreUObject` | 3,094 | 70,548 | 16 s |
-| Cached lookup | — | — | ~0.3 s |
-
-Cost discipline is the design. A lookup builds the project index (seconds) and uses an engine
-index only if one exists; `scope: "engine"` on a cold machine returns
-`engine index not built — build it with unreal_index (action: "build", scope: "engine")` instead of
-spending minutes on a scan nobody asked for. `unreal_index` is the explicit, paid path.
-
-Ranking inside `unreal_symbol`: exact (0) → qualified member (1) → prefix (2) → substring (3).
-Forward declarations rank last, so `unreal_symbol AActor` returns
-`Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h:282` (the `UCLASS` declaration), not
-the `class AActor;` line in `PhysicsCollision.h`.
-`unreal_symbol LpGameModeBase` finds `ALpGameModeBase` (the UE prefix is added for you); `unreal_symbol FLpMovementDirectionThresholds:F` finds a single-letter `UPROPERTY` field; `unreal_context LpCharacterTypes.h` resolves a bare file name through the index. Engine areas are derived from module
-dependencies (`.uproject` modules → recursive `PublicDependencyModuleNames` → plugin-supplied
-modules → `Engine/Source/<area>/*`), so the index contains what this project can compile against,
-not the whole engine.
-
-One engine fact worth knowing: UBT Query reports `"defines": []` for every module. The effective
-preprocessor set lives in a forced include —
-`Intermediate/Build/<Platform>/<Config>/<Target>/Development/<Module>/Definitions.<Module>.h` —
-and `unreal_context` reads that file instead of guessing `WITH_*` values. Query is also never
-run with `-NoIntellisense`: that flag produces a syntactically valid skeleton with an empty
-`moduleToCompileSettings`, and `payloadOk()` rejects it.
-
-## clangd enrichment (`unreal_index` action `compiledb`)
-
-The definition index is the compiler-free path. When you want clangd's semantic power (references,
-call hierarchy, diagnostics), the database it needs comes from the engine: `UnrealBuildTool
--Modes=GenerateClangDatabase`, normalized in the pi-unreal cache.
-
-The UnrealBuildTool invocation is the part nobody documents, so it is encoded in one place
-(`lib/compiledb.ts`):
-
-- The target is **three positional tokens** — `Win64 Development LpEditor`. `TargetDescriptor` only
-  inspects arguments that do not start with `-`, and its `+` split requires every token to be the
-  same kind, so `-Target=LpEditor` fails with `No platforms specified for target` and
-  `Win64+Development+LpEditor` fails with `The platform name Development is not a valid platform
-  name`. `-Platform=`/`-Configuration=` set `BuildConfiguration` only and produce a duplicate
-  platform error next to the positional tokens.
-- `-OutputDir=` must already exist (UnrealBuildTool throws
-  `DirectoryNotFoundException: Could not find a part of the path ...\compile_commands.json`), and
-  the mode's own `-NoPCH -NoVFS -Compiler=Clang` additions mean the emitted driver is
-  `clang-cl.exe`, not `cl.exe`.
-- `-Include=` rules match nothing useful (measured: `Source/Lp`, `*/Source/Lp/*`,
-  `C:/Users/.../Source/Lp/**` all yield an empty database), so scoping happens after generation.
-
-Normalization is Epic's `stripPostPch.py` recipe, ported: expand the per-module `@file.rsp`
-response files, drop `/Yu* /Fm* /Fe* /Fp*` and everything after `/link`, drop PCH translation
-units (`SharedPCH.*.h.cpp`, `PCH.*.h.cpp`) and header entries, then keep the requested scope. The
-database is written to `$PI_UNREAL_CACHE_DIR/compiledb/<target>.<platform>.<config>/` — it encodes
-this machine's absolute paths and toolchain version, so it is a machine artifact, never a repo one.
-
-`check: "<file>"` runs `clangd --check` against the result, which is the acceptance test. Measured
-on Lp (UE 5.8.3, installed engine, VS 18 LLVM clangd): UnrealBuildTool 1.5-1.7 s, 4 entries,
-4 response files expanded, 0 switches dropped; `clangd --check` built a 62 MB preamble and
-reported **`All checks completed, 0 errors`** in ~2.6 s.
-
-The honest limits of that 4-entry number: an installed (precompiled) engine contributes no compile
-actions, so the database covers the project's own translation units, not `Engine/Source`. Engine
-files still work under clangd because the project's `.clangd` supplies the include paths — exactly
-what Epic's Unreal-clangd VS Code extension does (its generated `Lp.0.rsp` contains only `/FI`
-plus 523 `/I` lines, and `compile_commands.json` there has 6 project entries and no engine entry).
-Re-run with `refresh: true` after changing `Build.cs` files, adding modules, or switching engine
-version.
-
-## How engine resolution works
-
-Mirrors `FDesktopPlatformWindows::GetAvailableEngineDescriptions`
-(`Engine/Source/Developer/DesktopPlatform/Private/DesktopPlatformBase.cpp:459-511`) and
-`VerifyEngineGuid` (`DesktopPlatformWindows.cpp:615-664`):
-
-| `.uproject` association | Source of truth |
+| Report | What to do |
 | --- | --- |
-| engine-root path | used directly, validated |
-| `5.8` (Launcher install) | `HKLM:\SOFTWARE\EpicGames\Unreal Engine\<ver>` → `InstalledDirectory`, then `<installDirDefault>\UE_<ver>` |
-| `{GUID}` (source build) | `HKCU:\SOFTWARE\Epic Games\Unreal Engine\Builds` |
-| empty | walk up 12 levels looking for `Engine/Config/BaseEngine.ini` |
+| `engine: AMBIGUOUS — more than one valid installation matches` | Two roots match the association. Pass the one you want as `engineRootHint` (e.g. `engineRootHint: "C:/Program Files/Epic Games/UE_5.8"`). |
+| `engine: UNRESOLVED` with rejected candidates | Read the reasons — a stale registry key, a missing `Build.version`, a version mismatch. The report lists remediation steps; the extension never writes registry keys for you. |
+| `no .uproject within 4 levels above …` | The search walks up from the working directory. Pass the project explicitly: `project: "C:/Work/Lp/Lp.uproject"` (a directory containing one works too). |
+| `unreal_symbol` finds nothing in scope `engine` | Build the engine index first (`unreal_index` → `action: "build"`, `scope: "engine"`). |
+| Results look stale after a rebase or engine update | Re-run with `refresh: true`, or `/unreal-cache clear`. |
+| `no plugin named "X" in the index` | That reference is genuinely not on disk. `/unreal` shows which roots were scanned. |
 
-Below the association: `LauncherInstalled.dat`, `HKLM` versions, `UNREAL_ENGINE` / `UE_ROOT` /
-`PI_UNREAL_ENGINE_ROOT`, and a scan of `C:/Program Files/Epic Games` for `UE_*`. Explicit
-`engineRootHint` outranks every registry source.
+## What it deliberately does not do
 
-Every candidate is validated before use — `Engine/Binaries` + `Engine/Build`
-(`DesktopPlatformBase.cpp:401-421`) **and** `Engine/Build/Build.version` matching the
-association. Stale registry keys and env pointers are reported as rejected candidates with the
-reason, never silently dropped. One survivor → `resolved`; several → `ambiguous`; none →
-`unresolved` + remediation. Nothing is ever written back to the registry.
+- It does not install, register, migrate, or "fix" an engine, and never writes registry keys.
+- It does not build, cook, package, launch the editor, or edit `.ini` files.
+- It does not hand-edit assets, and blocks attempts to.
+- Symbol lookup reports **declarations**. Type resolution, overloads, call sites, inheritance and
+  diagnostics are clangd's job when clangd is installed.
+- `.ini` provenance, live-coding state, and asset metadata are out of scope for v1.
 
-Registry reads run through one memoized `pwsh -NoProfile` snapshot (8 s timeout). If `pwsh` is
-missing the snapshot degrades to `available: false` and the resolver continues with
-file-based sources — the extension never fails at import time.
+## Not published to npm yet
 
-## Plugin discovery
+`pi-unreal` is not on npmjs. Install instructions will land with the first published release —
+until then, use it from a clone (see *Developers* below).
 
-Mirrors `UnrealBuildTool.System.ReadAvailablePlugins` (`System/Plugins.cs:322`):
-Engine `Engine/Plugins` → Project `Plugins/` → Mod `Mods/` → `AdditionalPluginDirectories`,
-with later scans shadowing earlier ones on name collision. `Binaries/`, `Intermediate/`,
-`Saved/`, `.git/`, `ThirdParty/` are skipped. Reference semantics mirror `PluginManager`:
-`Enabled` / `Optional` / `Activate` (`PluginReferenceDescriptor.cpp:132-172`); an engine-version
-mismatch is a warning, not an error (`PluginManager.cpp:2690-2712`).
-
-Indexes are cached on disk keyed by the mtime of every scanned directory plus the engine
-changelist, with a 10-minute backstop (`MAX_AGE_MS`) because content-only `.uplugin` edits do
-not move the parent directory's mtime.
-
-## Descriptor fidelity
-
-Field names, host types, and loading phases are transcribed from the engine's serializers
-(UE 5.8): `ProjectDescriptor.cpp:100-225`, `PluginDescriptor.cpp:263-409`,
-`ModuleDescriptor.cpp`, `PluginReferenceDescriptor.cpp:130-180`, cross-checked against 897
-`.uplugin` files in UE 5.8 `Engine/Plugins`. Consequences:
-
-- `.uproject` / `.uplugin` are parsed as JSONC (comments and trailing commas are legal in the
-  engine's reader).
-- `Modules` is an array of objects keyed by `Name`; `Type` is required
-  (`Found Module entry 'X' with a missing 'Type' field`), `LoadingPhase` defaults to `Default`.
-- A plugin reference without `"Enabled"` is rejected by UE 5.8 — reported, not guessed.
-- Unknown keys are reported as `… is not serialized by FPluginDescriptor`, and the known-key
-  set is wide enough (including legacy `Whitelist*`/`Blacklist*` and pre-5.x keys) that genuine
-  engine files produce no noise.
-- `.uplugin` has no `Enabled` key; enablement is `EnabledByDefault` + the project reference.
-- `IsBetaVersion` is metadata in UE 5.8 (no engine/UBT beta gate exists).
-
-## Verify
+## Developers
 
 ```bash
 bun test                      # 64 tests: resolver, descriptors, plugins, cache, gate, scanner, index, compile-db pipeline
@@ -222,40 +150,18 @@ bun test/keys.census.mjs "C:/Program Files/Epic Games/UE_5.8/Engine/Plugins"
 bun run tmp/smoke.mjs project "C:/path/to/Project"     # symbol index against a real project
 bun run tmp/smoke.mjs query "C:/path/to/Project"       # UnrealBuildTool Query round trip
 bun run tmp/smoke.mjs engine "C:/path/to/Project"      # Engine/Source index (minutes, opt-in)
-bun run tmp/smoke.mjs compiledb "C:/path/to/Project"    # clangd database + `clangd --check` acceptance
+bun run tmp/smoke.mjs compiledb "C:/path/to/Project"   # clangd database + `clangd --check` acceptance
 ```
 
-`test/live-check.ts` prints the real resolution for a real project, the installation table, a
-plugin-reference report, and cold-vs-warm index timings. `test/keys.census.mjs` counts descriptor
-keys in real engine files so diagnostics stay honest.
+From a clone, load the extension into a session without installing it:
 
-## Known limits
+```bash
+pi -e ./extensions/unreal/index.ts
+```
 
-- Registry access needs `pwsh` (PowerShell 7). Without it, registry sources are unavailable and
-  resolution relies on env, directory scans, and inline associations.
-- `unreal_resolve_engine` reports what the machine can prove. It does not install, register, or
-  migrate engines, and never writes registry keys (the engine's `RegisterEngineInstallation`
-  does; this package deliberately does not).
-- v1 is inspection only. `.ini` provenance is out of scope.
-- The definition index is a scanner, not a parser: it finds declarations (`class`, `struct`,
-  `enum`, `union`, `UFUNCTION`/`UPROPERTY`/`UCLASS`-marked members, delegates, aliases) and
-  records `Owner:Member` qualified names. It does not resolve types, overloads, call sites, or
-  inheritance — that is what clangd is for when it is installed. Macro-heavy code can still be
-  misread: the scanner is regex-based, so a definition hidden inside an unusual macro spelling may
-  be missed, and `#if` branches are all recorded (a symbol declared in a disabled branch is a
-  candidate, not a guarantee).
-- `moduleRefs` and `includePaths` come from UnrealBuildTool Query, which needs a buildable
-  target for the project; when Query fails the index still builds and says so.
-- The engine index is never built implicitly: scans are opt-in through `unreal_index`.
-- `action: "compiledb"` needs UnrealBuildTool (so an engine installation) and, for the
-  `clangd --check` acceptance step, a clangd binary — `CLANGD_PATH`, the Visual Studio LLVM
-  toolset, the WinGet LLVM package, or `C:/Program Files/LLVM/bin`. Without clangd the database is
-  still produced and reported; only the check is skipped.
-- On an installed engine the compile database covers the project's translation units (engine
-  modules are precompiled and contribute no compile actions). The engine-wide scope of
-  `project+engine` is the source-built case, and there it is a ~1 GB artifact taking minutes.
-- Engine area selection is a cost dial, not a completeness claim. `DEFAULT_ENGINE_AREAS =
-  ["Runtime"]` covers every gameplay type (`AActor`, `UAnimInstance`, `USceneComponent`) at
-  18,566 files; `Editor` and `Developer` are opt-in via `engineAreas` and roughly triple the scan.
-- Index reuse requires the *same root set*: an index built over two modules is never used to answer
-  a `Runtime`-wide query. Partial coverage reported as an answer is worse than a rebuild.
+Layout: `extensions/unreal/index.ts` (tools, commands, context card, convention gate),
+`extensions/unreal/lib/` (resolver, descriptors, plugin index, symbol index, UBT Query, compile
+database), `prompts/unreal-context.md`, `skills/ue-engine-resolution/`, `test/`.
+
+Design notes and measured internals — engine resolution algorithm, descriptor fidelity, plugin
+discovery, the index and compile-database pipeline — are in [docs/internals.md](docs/internals.md).
