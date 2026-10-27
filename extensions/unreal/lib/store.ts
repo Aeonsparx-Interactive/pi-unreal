@@ -831,7 +831,7 @@ export interface RootOptions {
 	/** Plugin directories (absolute), e.g. from `PluginSummary.dir`. */
 	pluginDirs?: string[];
 	includeEngine?: boolean;
-	/** Sub-directories of `Engine/Source` to scan. Default `["Runtime", "Editor", "Developer"]`. */
+	/** Sub-directories of `Engine/Source` to scan. Default `DEFAULT_ENGINE_AREAS` (`["Runtime"]`). */
 	engineAreas?: string[];
 	fs?: FsAdapter;
 }

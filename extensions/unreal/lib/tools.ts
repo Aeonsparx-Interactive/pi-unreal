@@ -522,7 +522,7 @@ export async function indexBuild(input: IndexBuildInput) {
 		built: handle.built,
 		mode: input.mode,
 		scope: input.scope,
-		engineAreas: input.engineAreas ?? ["Runtime", "Editor", "Developer"],
+		engineAreas: input.engineAreas ?? DEFAULT_ENGINE_AREAS,
 		symbols: handle.index?.meta.counts.symbols ?? 0,
 		files: handle.index?.meta.counts.files ?? 0,
 		modules: handle.index?.meta.counts.modules ?? 0,

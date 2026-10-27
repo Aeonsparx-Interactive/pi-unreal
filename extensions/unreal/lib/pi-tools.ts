@@ -34,7 +34,11 @@ const TargetSchema = Type.Optional(Type.String({ description: "UBT target whose 
 const PlatformSchema = Type.Optional(Type.String({ description: "Target platform. Default: this machine's platform (Win64 on Windows)." }));
 const ConfigurationSchema = Type.Optional(Type.String({ description: "Target configuration: Development (default), DebugGame, Shipping." }));
 
+/** Every tool takes the workspace directory; the session cwd is the default so agents rarely pass it. */
+const CwdSchema = Type.Optional(Type.String({ description: "Workspace directory containing the .uproject. Default: the session cwd." }));
+
 const SymbolParams = Type.Object({
+	cwd: CwdSchema,
 	query: Type.String({ description: "Symbol name: 'AActor', 'UAnimInstance', 'AActor:Tick' (qualified), or a bare method name together with 'owner'." }),
 	owner: Type.Optional(Type.String({ description: "Owner type for a member lookup: query 'Tick' + owner 'AActor'. A bare method name is resolved through its owner." })),
 	scope: ScopeSchema,
@@ -45,6 +49,7 @@ const SymbolParams = Type.Object({
 });
 
 const ListParams = Type.Object({
+	cwd: CwdSchema,
 	prefix: Type.String({ description: "Symbol-name prefix, e.g. 'ULp' or 'ANiMy'." }),
 	scope: ScopeSchema,
 	engineAreas: EngineAreasSchema,
@@ -58,6 +63,7 @@ const ListParams = Type.Object({
 });
 
 const ContextParams = Type.Object({
+	cwd: CwdSchema,
 	file: Type.Optional(Type.String({ description: "Source file to describe (.h/.cpp in the project, a plugin, or Engine/Source): its module, declarations, include paths, defines file." })),
 	module: Type.Optional(Type.String({ description: "Module to describe instead of a file, e.g. 'GameplayAbilities' — dependency lists, include paths, defines file, standard, SDK." })),
 	target: TargetSchema,
@@ -70,6 +76,7 @@ const ContextParams = Type.Object({
 });
 
 const IndexParams = Type.Object({
+	cwd: CwdSchema,
 	action: Type.Union([Type.Literal("build"), Type.Literal("status")], { description: "'build' creates or refreshes an index. 'status' lists what is cached and what building will cost." }),
 	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("engine")], { description: "Index scope for 'build'. Default 'project' (seconds). 'engine' scans Engine/Source (minutes the first time)." })),
 	mode: Type.Optional(Type.Union([Type.Literal("definitions"), Type.Literal("full")], { description: "'definitions' = symbol -> file:line only (default, fast). 'full' also records per-file include sets and needs UnrealBuildTool Query (~7s, no compiler)." })),
@@ -175,8 +182,8 @@ export const unrealSymbol = defineTool({
 
 	async execute(_id, params, _signal, _update, ctx) {
 		const query = params.owner ? `${params.owner}:${params.query}` : params.query;
-		const out = await symbolLookup({ cwd: ctx.cwd, query, scope: params.scope as Scope | undefined, engineAreas: params.engineAreas, module: params.module, prefix: params.prefix, limit: params.limit, fs: realFs });
-		const rows = out.results.map((row) => rowLine(row, ctx.cwd));
+		const out = await symbolLookup({ cwd: params.cwd ?? ctx.cwd, query, scope: params.scope as Scope | undefined, engineAreas: params.engineAreas, module: params.module, prefix: params.prefix, limit: params.limit, fs: realFs });
+		const rows = out.results.map((row) => rowLine(row, params.cwd ?? ctx.cwd));
 		const text = [`unreal_symbol '${query}' scope=${out.scope}: ${out.total} definition(s)`, ...rows, ...out.notes.map((n) => `· ${n}`), ...(out.warnings ?? []).map((w) => `! ${w}`)].join("\n");
 		return result(text, out, out.total === 0);
 	},
@@ -197,8 +204,8 @@ export const unrealSymbolList = defineTool({
 	executionMode: "parallel",
 
 	async execute(_id, params, _signal, _update, ctx) {
-		const out = await symbolList({ cwd: ctx.cwd, prefix: params.prefix, scope: params.scope as Scope | undefined, kind: params.kind, module: params.module, engineAreas: params.engineAreas, limit: params.limit ?? 40, fs: realFs });
-		const rows = out.symbols.map((row) => rowLine(row, ctx.cwd));
+		const out = await symbolList({ cwd: params.cwd ?? ctx.cwd, prefix: params.prefix, scope: params.scope as Scope | undefined, kind: params.kind, module: params.module, engineAreas: params.engineAreas, limit: params.limit ?? 40, fs: realFs });
+		const rows = out.symbols.map((row) => rowLine(row, params.cwd ?? ctx.cwd));
 		const text = [`unreal_symbol_list '${params.prefix}' scope=${out.scope}: ${out.total} symbol(s)`, ...rows, ...out.notes.map((n) => `· ${n}`)].join("\n");
 		return result(text, out);
 	},
@@ -226,7 +233,7 @@ export const unrealContext = defineTool({
 
 		if (params.file) {
 			const fc = await fileContext({
-				cwd: ctx.cwd,
+				cwd: params.cwd ?? ctx.cwd,
 				file: params.file,
 				mode: params.includeDefines ? "full" : "definitions",
 				includeDefines: params.includeDefines,
@@ -237,7 +244,7 @@ export const unrealContext = defineTool({
 			});
 			const c = fc.compile;
 			const lines = [
-				`unreal_context ${shortPath(fc.file, ctx.cwd)}  mode=${fc.mode}  module=${fc.module ?? "?"}${fc.indexKey ? `  index=${fc.indexKey}` : ""}`,
+				`unreal_context ${shortPath(fc.file, params.cwd ?? ctx.cwd)}  mode=${fc.mode}  module=${fc.module ?? "?"}${fc.indexKey ? `  index=${fc.indexKey}` : ""}`,
 			];
 			if (c) {
 				lines.push(
@@ -249,8 +256,8 @@ export const unrealContext = defineTool({
 				if (c.moduleRefs.circular.length) lines.push(`  circular: ${c.moduleRefs.circular.join(", ")}`);
 				if (c.moduleRefs.dynamicallyLoaded.length) lines.push(`  dynamicallyLoaded: ${c.moduleRefs.dynamicallyLoaded.join(", ")}`);
 				if (c.declares.length) lines.push(`  declares: ${c.declares.slice(0, 24).join(", ")}`);
-				if (c.definesFile) lines.push(`  defines file: ${shortPath(c.definesFile, ctx.cwd)}`);
-				if (c.forcedIncludes.length) lines.push(`  forced includes: ${c.forcedIncludes.slice(0, 3).map((f) => shortPath(f, ctx.cwd)).join(", ")}`);
+				if (c.definesFile) lines.push(`  defines file: ${shortPath(c.definesFile, params.cwd ?? ctx.cwd)}`);
+				if (c.forcedIncludes.length) lines.push(`  forced includes: ${c.forcedIncludes.slice(0, 3).map((f) => shortPath(f, params.cwd ?? ctx.cwd)).join(", ")}`);
 				lines.push(...c.notes.map((n) => `· ${n}`));
 			}
 			if (fc.defines?.length) lines.push(`  defines: ${fc.defines.slice(0, 40).join(" ")}`);
@@ -260,7 +267,7 @@ export const unrealContext = defineTool({
 		}
 
 		const out = await buildContext({
-			cwd: ctx.cwd,
+			cwd: params.cwd ?? ctx.cwd,
 			module: params.module,
 			target: params.target,
 			platform: params.platform,
@@ -274,12 +281,12 @@ export const unrealContext = defineTool({
 		const m = out.module;
 		const lines = [
 			`unreal_context module ${m?.name ?? params.module}  target=${out.target?.target} ${out.target?.platform} ${out.target?.configuration} (${out.target?.source ?? "?"})`,
-			`  dir: ${shortPath(m?.directory, ctx.cwd) ?? "?"}${m?.standard ? `  standard=${m.standard}` : ""}${m?.windowsSdkVersion ? `  sdk=${m.windowsSdkVersion}` : ""}`,
+			`  dir: ${shortPath(m?.directory, params.cwd ?? ctx.cwd) ?? "?"}${m?.standard ? `  standard=${m.standard}` : ""}${m?.windowsSdkVersion ? `  sdk=${m.windowsSdkVersion}` : ""}`,
 			`  deps: ${m?.dependencies ?? 0} · public headers: ${m?.publicHeaders ?? 0} · private headers: ${m?.privateHeaders ?? 0} · include paths: ${m?.includePaths ?? 0} · total headers: ${out.headerCount}`,
 			`  query cache: ${out.queryCache?.source ?? "?"}${out.queryCache?.durationMs ? ` (${JSON.stringify(out.queryCache.durationMs)} ms)` : ""}`,
 		];
 		lines.push(...bullets("publicInclude", m?.publicInclude ?? []), ...bullets("privateInclude", m?.privateInclude ?? []), ...bullets("circular", m?.circular ?? []), ...bullets("dynamicallyLoaded", m?.dynamicallyLoaded ?? []));
-		if (m?.definesFile) lines.push(`  defines file: ${shortPath(m.definesFile, ctx.cwd)}`);
+		if (m?.definesFile) lines.push(`  defines file: ${shortPath(m.definesFile, params.cwd ?? ctx.cwd)}`);
 		if (out.defines?.length) lines.push(`  defines: ${out.defines.slice(0, 40).join(" ")}`);
 		if (m?.compilerPath) lines.push(`  compiler: ${m.compilerPath}`);
 		if (out.projectModules?.length) lines.push(`  project modules: ${out.projectModules.map((entry) => entry.name).slice(0, 20).join(", ")}`);
@@ -306,7 +313,7 @@ export const unrealIndex = defineTool({
 
 	async execute(_id, params, _signal, _update, ctx) {
 		if (params.action === "status") {
-			const out = indexStatus(ctx.cwd, realFs);
+			const out = indexStatus(params.cwd ?? ctx.cwd, realFs);
 			const lines = [
 				`cache: ${out.cacheDir}`,
 				`query cache: ${out.query.usable ? `${out.query.target.target} ${out.query.target.platform} ${out.query.target.configuration} (${out.query.target.source})` : "not built"}`,
@@ -322,7 +329,7 @@ export const unrealIndex = defineTool({
 		}
 
 		const out = await indexBuild({
-			cwd: ctx.cwd,
+			cwd: params.cwd ?? ctx.cwd,
 			scope: (params.scope ?? "project") as "project" | "engine",
 			mode: (params.mode ?? "definitions") as "definitions" | "full",
 			engineAreas: params.engineAreas,
@@ -335,7 +342,7 @@ export const unrealIndex = defineTool({
 		const seconds = out.durationMs != null ? (out.durationMs / 1000).toFixed(1) : "?";
 		const text = [
 			`unreal_index build scope=${out.scope} mode=${out.mode} → ${out.key}`,
-			`  ${out.symbols} symbols / ${out.files} files / ${out.modules} modules from ${out.roots} roots in ${seconds}s`,
+			`  ${out.symbols} symbols / ${out.files} files / ${out.modules} modules from ${out.roots} roots ${out.built ? `in ${seconds}s` : "(cached, reused as is)"}`,
 			`  areas: ${(out.engineAreas ?? []).join(", ")}`,
 			`  dir: ${out.indexDir ?? "not built"}`,
 			...out.notes.map((n) => `· ${n}`),
