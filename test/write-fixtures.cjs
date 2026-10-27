@@ -30,7 +30,7 @@ function refLines(list) {
 
 fs.writeFileSync(
 	path.join(F, "ProjDir", "Fixture.uproject"),
-	`// JSONC fixture: comments, a trailing comma, and a key the engine does not serialize.\n{\n\t"FileVersion": 3,\n\t"EngineAssociation": "5.8",\n\t"Category": "Testing",\n\t"Description": "Fixture project",\n\t"Modules": [\n\t\t{ "Name": "Fixture", "Type": "Runtime", "LoadingPhase": "Default" },\n\t\t{ "Name": "FixtureEditor", "Type": "Editor", "LoadingPhase": "Default", "AdditionalDependencies": ["UnrealEd"] },\n\t],\n\t"Plugins": [\n${refLines(refs)}\n\t],\n\t"TargetPlatforms": [ "Windows", "Android", ],\n\t"AdditionalPluginDirectories": [\n\t\t"${projDir}/Extra"\n\t],\n\t"NotAnEngineField": true,\n}\n`,
+	`// JSONC fixture: comments, a trailing comma, and a key the engine does not serialize.\n{\n\t"FileVersion": 3,\n\t"EngineAssociation": "5.8",\n\t"Category": "Testing",\n\t"Description": "Fixture project",\n\t"Modules": [\n\t\t{ "Name": "Fixture", "Type": "Runtime", "LoadingPhase": "Default" },\n\t\t{ "Name": "FixtureEditor", "Type": "Editor", "LoadingPhase": "Default", "AdditionalDependencies": ["UnrealEd"] },\n\t],\n\t"Plugins": [\n${refLines(refs)}\n\t],\n\t"TargetPlatforms": [ "Windows", "Android", ],\n\t"AdditionalPluginDirectories": [\n\t\t"${ROOT}/ProjDir/Extra"\n\t],\n\t"NotAnEngineField": true,\n}\n`,
 );
 
 fs.writeFileSync(

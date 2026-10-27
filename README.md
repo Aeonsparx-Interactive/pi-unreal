@@ -179,7 +179,7 @@ attestation path through stage-then-approve is unverified).
 ## Developers
 
 ```bash
-bun test                      # 64 tests: resolver, descriptors, plugins, cache, gate, scanner, index, compile-db pipeline
+bun test                      # 66 tests: resolver, descriptors, plugins, cache, gate, scanner, index, compile-db pipeline, fixture hygiene
 bun run typecheck             # tsc --noEmit
 bun test/live-check.ts "C:/path/to/Project.uproject"   # live machine smoke
 bun test/keys.census.mjs "C:/Program Files/Epic Games/UE_5.8/Engine/Plugins"

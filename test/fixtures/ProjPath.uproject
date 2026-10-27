@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "C:/Users/Luqman/Documents/pi-unreal/test/fixtures/EngineA",
+	"EngineAssociation": "__FIXTURE_ROOT__/EngineA",
 	"Modules": [
 		{
 			"Name": "P",

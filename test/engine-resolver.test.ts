@@ -1,5 +1,5 @@
 import os from "node:os";
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import {
 	enumerateInstallations,
 	findProjectFile,
@@ -9,10 +9,15 @@ import {
 import { parseEngineVersion } from "../extensions/unreal/lib/descriptors.ts";
 import { createStaticRegistryReader } from "../extensions/unreal/lib/registry.ts";
 import { realFs } from "../extensions/unreal/lib/util.ts";
-import { ENGINE_A, ENGINE_B, ENGINE_C, FIXTURES, GUID, PROJECT_DIR } from "./helpers.ts";
+import { ENGINE_A, ENGINE_B, ENGINE_C, FIXTURES, GUID, PROJECT_DIR, materializeFixtures, releaseFixtures } from "./helpers.ts";
 
 const HERMETIC = { ProgramFiles: `${FIXTURES}/Empty/ScanRoot` };
 const noScanEnv = HERMETIC;
+
+// `.uproject` inline `EngineAssociation` paths are absolute, so they must be materialized: a
+// committed fixture cannot carry a machine-specific root. See test/helpers.ts.
+const fx = materializeFixtures();
+afterAll(() => releaseFixtures(fx));
 
 describe("engine resolution", () => {
 	it("parses a full Build.version string", () => {
@@ -27,9 +32,9 @@ describe("engine resolution", () => {
 	});
 
 	it("prefers an inline path association (Epic's first step)", async () => {
-		const result = await resolveEngineForProject(`${FIXTURES}/ProjPath.uproject`, { registry: createStaticRegistryReader({ available: false, hklmVersions: [], hkcuBuilds: [], launcherDatPath: "", launcherDatExists: false }), env: HERMETIC });
+		const result = await resolveEngineForProject(`${fx.root}/ProjPath.uproject`, { registry: createStaticRegistryReader({ available: false, hklmVersions: [], hkcuBuilds: [], launcherDatPath: "", launcherDatExists: false }), env: HERMETIC });
 		expect(result.status).toBe("resolved");
-		expect(result.engineRoot).toBe(ENGINE_A);
+		expect(result.engineRoot).toBe(fx.engineA);
 		expect(result.source).toBe("uproject-inline-path");
 		expect(result.associationKind).toBe("inline-path");
 		expect(result.version).toMatchObject({ major: 5, minor: 8, patch: 3 });
@@ -52,8 +57,8 @@ describe("engine resolution", () => {
 		expect(result.status).toBe("unresolved");
 		expect(result.associationKind).toBe("unknown");
 
-		const versioned = await resolveEngineForProject(`${FIXTURES}/ProjPath.uproject`, { registry, env: HERMETIC });
-		expect(versioned.engineRoot).toBe(ENGINE_A);
+		const versioned = await resolveEngineForProject(`${fx.root}/ProjPath.uproject`, { registry, env: HERMETIC });
+		expect(versioned.engineRoot).toBe(fx.engineA);
 	});
 
 	it("resolves a version association to exactly one installation", async () => {

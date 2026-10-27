@@ -49,7 +49,7 @@
 	],
 	"TargetPlatforms": [ "Windows", "Android", ],
 	"AdditionalPluginDirectories": [
-		"C:/Users/Luqman/Documents/pi-unreal/test/fixtures/ProjDir/Extra"
+		"__FIXTURE_ROOT__/ProjDir/Extra"
 	],
 	"NotAnEngineField": true,
 }

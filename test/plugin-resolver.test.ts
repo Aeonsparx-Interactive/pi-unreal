@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
 import { parseUproject } from "../extensions/unreal/lib/descriptors.ts";
 import { readBuildVersion } from "../extensions/unreal/lib/descriptors.ts";
 import {
@@ -8,14 +8,19 @@ import {
 	resolveProjectPlugins,
 } from "../extensions/unreal/lib/plugin-resolver.ts";
 import { realFs } from "../extensions/unreal/lib/util.ts";
-import { ENGINE_A, PROJECT_DIR, FIXTURES } from "./helpers.ts";
+import { ENGINE_A, PROJECT_DIR, FIXTURES, materializeFixtures, releaseFixtures } from "./helpers.ts";
+
+// The fixture project's `AdditionalPluginDirectories` entry is an absolute scan root, so it is only
+// meaningful inside a materialized copy (CI has no `C:/Users/...` tree). See test/helpers.ts.
+const fx = materializeFixtures();
+afterAll(() => releaseFixtures(fx));
 
 async function fixtureIndex() {
-	const descriptor = parseUproject(`${PROJECT_DIR}/Fixture.uproject`, realFs);
-	const version = readBuildVersion(ENGINE_A, realFs);
+	const descriptor = parseUproject(fx.project, realFs);
+	const version = readBuildVersion(fx.engineA, realFs);
 	const index = await buildPluginIndex({
-		engineRoot: ENGINE_A,
-		projectDir: PROJECT_DIR,
+		engineRoot: fx.engineA,
+		projectDir: fx.projectDir,
 		additionalPluginDirectories: descriptor.additionalPluginDirectories,
 		fs: realFs,
 	});

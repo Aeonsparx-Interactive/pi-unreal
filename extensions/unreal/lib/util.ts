@@ -29,7 +29,7 @@ export function normalizePath(path: string): string {
 
 /** Absolute on this platform (Windows drive letter, UNC, POSIX `/`). */
 export function isAbsolutePath(path: string): boolean {
-	return /^[a-z]:\//i.test(path) || path.startsWith("//");
+	return /^[a-z]:\//i.test(path) || path.startsWith("//") || path.startsWith("/");
 }
 
 export function joinPath(base: string, ...parts: string[]): string {
