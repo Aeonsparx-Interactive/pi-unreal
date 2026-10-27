@@ -26,7 +26,8 @@ const ScopeSchema = Type.Optional(
 );
 const EngineAreasSchema = Type.Optional(
 	Type.Array(Type.String(), {
-		description: 'Engine/Source sub-areas for engine-scope work, e.g. ["Runtime"] or ["Runtime/Core","Runtime/CoreUObject"]. Default: Runtime, Editor, Developer.',
+			// Must match DEFAULT_ENGINE_AREAS in lib/store.ts — the schema description is what agents read.
+		description: 'Engine/Source sub-areas for engine-scope work, e.g. ["Runtime"] or ["Runtime/Core","Runtime/CoreUObject"]. Default: ["Runtime"] (DEFAULT_ENGINE_AREAS in lib/store.ts); "Editor" and "Developer" are opt-in and roughly triple the scan.',
 	}),
 );
 const LimitSchema = Type.Optional(Type.Number({ description: "Maximum rows to return. Default 25." }));
