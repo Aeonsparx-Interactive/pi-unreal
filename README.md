@@ -28,7 +28,7 @@ are peer dependencies and are never bundled.
 | `unreal_plugin_inspect` | one `.uplugin` as the engine parses it, plus its declared plugin dependencies |
 | `unreal_symbol` | "where is this class/function/property/delegate declared?" — file, line, module |
 | `unreal_context` | "what does this file/module include, define, and own?" — real `Definitions.*.h` defines |
-| `unreal_index` | build, refresh, patch, inspect; `includePaths` and `moduleRefs` from UnrealBuildTool |
+| `unreal_index` | build, refresh, patch, inspect; `includePaths` and `moduleRefs` from UnrealBuildTool; `action: "compiledb"` for the clangd database |
 
 All seven are read-only and idempotent. The three inspection tools accept `project` (file or
 directory; defaults to the nearest `.uproject` within 4 levels of the workspace) and
@@ -113,6 +113,47 @@ and `unreal_context` reads that file instead of guessing `WITH_*` values. Query 
 run with `-NoIntellisense`: that flag produces a syntactically valid skeleton with an empty
 `moduleToCompileSettings`, and `payloadOk()` rejects it.
 
+## clangd enrichment (`unreal_index` action `compiledb`)
+
+The definition index is the compiler-free path. When you want clangd's semantic power (references,
+call hierarchy, diagnostics), the database it needs comes from the engine: `UnrealBuildTool
+-Modes=GenerateClangDatabase`, normalized in the pi-unreal cache.
+
+The UnrealBuildTool invocation is the part nobody documents, so it is encoded in one place
+(`lib/compiledb.ts`):
+
+- The target is **three positional tokens** — `Win64 Development LpEditor`. `TargetDescriptor` only
+  inspects arguments that do not start with `-`, and its `+` split requires every token to be the
+  same kind, so `-Target=LpEditor` fails with `No platforms specified for target` and
+  `Win64+Development+LpEditor` fails with `The platform name Development is not a valid platform
+  name`. `-Platform=`/`-Configuration=` set `BuildConfiguration` only and produce a duplicate
+  platform error next to the positional tokens.
+- `-OutputDir=` must already exist (UnrealBuildTool throws
+  `DirectoryNotFoundException: Could not find a part of the path ...\compile_commands.json`), and
+  the mode's own `-NoPCH -NoVFS -Compiler=Clang` additions mean the emitted driver is
+  `clang-cl.exe`, not `cl.exe`.
+- `-Include=` rules match nothing useful (measured: `Source/Lp`, `*/Source/Lp/*`,
+  `C:/Users/.../Source/Lp/**` all yield an empty database), so scoping happens after generation.
+
+Normalization is Epic's `stripPostPch.py` recipe, ported: expand the per-module `@file.rsp`
+response files, drop `/Yu* /Fm* /Fe* /Fp*` and everything after `/link`, drop PCH translation
+units (`SharedPCH.*.h.cpp`, `PCH.*.h.cpp`) and header entries, then keep the requested scope. The
+database is written to `$PI_UNREAL_CACHE_DIR/compiledb/<target>.<platform>.<config>/` — it encodes
+this machine's absolute paths and toolchain version, so it is a machine artifact, never a repo one.
+
+`check: "<file>"` runs `clangd --check` against the result, which is the acceptance test. Measured
+on Lp (UE 5.8.3, installed engine, VS 18 LLVM clangd): UnrealBuildTool 1.5-1.7 s, 4 entries,
+4 response files expanded, 0 switches dropped; `clangd --check` built a 62 MB preamble and
+reported **`All checks completed, 0 errors`** in ~2.6 s.
+
+The honest limits of that 4-entry number: an installed (precompiled) engine contributes no compile
+actions, so the database covers the project's own translation units, not `Engine/Source`. Engine
+files still work under clangd because the project's `.clangd` supplies the include paths — exactly
+what Epic's Unreal-clangd VS Code extension does (its generated `Lp.0.rsp` contains only `/FI`
+plus 523 `/I` lines, and `compile_commands.json` there has 6 project entries and no engine entry).
+Re-run with `refresh: true` after changing `Build.cs` files, adding modules, or switching engine
+version.
+
 ## How engine resolution works
 
 Mirrors `FDesktopPlatformWindows::GetAvailableEngineDescriptions`
@@ -174,13 +215,14 @@ Field names, host types, and loading phases are transcribed from the engine's se
 ## Verify
 
 ```bash
-bun test                      # 57 tests: resolver, descriptors, plugins, cache, gate, scanner, index
+bun test                      # 64 tests: resolver, descriptors, plugins, cache, gate, scanner, index, compile-db pipeline
 bun run typecheck             # tsc --noEmit
 bun test/live-check.ts "C:/path/to/Project.uproject"   # live machine smoke
 bun test/keys.census.mjs "C:/Program Files/Epic Games/UE_5.8/Engine/Plugins"
 bun run tmp/smoke.mjs project "C:/path/to/Project"     # symbol index against a real project
 bun run tmp/smoke.mjs query "C:/path/to/Project"       # UnrealBuildTool Query round trip
 bun run tmp/smoke.mjs engine "C:/path/to/Project"      # Engine/Source index (minutes, opt-in)
+bun run tmp/smoke.mjs compiledb "C:/path/to/Project"    # clangd database + `clangd --check` acceptance
 ```
 
 `test/live-check.ts` prints the real resolution for a real project, the installation table, a
@@ -205,6 +247,13 @@ keys in real engine files so diagnostics stay honest.
 - `moduleRefs` and `includePaths` come from UnrealBuildTool Query, which needs a buildable
   target for the project; when Query fails the index still builds and says so.
 - The engine index is never built implicitly: scans are opt-in through `unreal_index`.
+- `action: "compiledb"` needs UnrealBuildTool (so an engine installation) and, for the
+  `clangd --check` acceptance step, a clangd binary — `CLANGD_PATH`, the Visual Studio LLVM
+  toolset, the WinGet LLVM package, or `C:/Program Files/LLVM/bin`. Without clangd the database is
+  still produced and reported; only the check is skipped.
+- On an installed engine the compile database covers the project's translation units (engine
+  modules are precompiled and contribute no compile actions). The engine-wide scope of
+  `project+engine` is the source-built case, and there it is a ~1 GB artifact taking minutes.
 - Engine area selection is a cost dial, not a completeness claim. `DEFAULT_ENGINE_AREAS =
   ["Runtime"]` covers every gameplay type (`AActor`, `UAnimInstance`, `USceneComponent`) at
   18,566 files; `Editor` and `Developer` are opt-in via `engineAreas` and roughly triple the scan.

@@ -39,6 +39,8 @@ import {
 	DEFAULT_ENGINE_AREAS,
 } from "./store.ts";
 import { hostPlatform, parseModuleReferences, parseTargetDetails, readQueryJson, type UbtModuleRefs, type UbtModuleSettings } from "./ubt.ts";
+import { discoverTargets, pickDefaultTarget } from "./ubt.ts";
+import { clangdCheck, ensureCompileDb } from "./compiledb.ts";
 import { baseName, joinPath, normalizePath, realFs, type FsAdapter } from "./util.ts";
 
 /** Where the project, its engine, and its enabled plugins live. */
@@ -533,4 +535,80 @@ export async function indexBuild(input: IndexBuildInput) {
 		notes: [...workspace.notes, ...handle.notes, ...notes],
 		warnings: handle.warnings,
 	};
+}
+
+/* ────────────────────────────────────────────────────────────── compile database */
+
+/** Default clangd scope: the project, its enabled plugins, and (with 'engine') Engine/Source. */
+export function compileDbScope(input: { projectDir?: string; pluginDirs?: string[]; engineRoot?: string; scope: "project" | "project+engine" }): string[] {
+	const include = [input.projectDir, ...(input.pluginDirs ?? [])].filter((dir): dir is string => Boolean(dir)).map(normalizePath);
+	if (input.scope === "project+engine" && input.engineRoot) include.push(normalizePath(joinPath(input.engineRoot, "Engine/Source")));
+	return include;
+}
+
+export interface CompileDbInput {
+	cwd: string;
+	/** 'project' = project + enabled plugin sources. 'project+engine' adds all of Engine/Source. */
+	scope?: "project" | "project+engine";
+	/** Explicit include prefixes; overrides 'scope'. */
+	include?: string[];
+	target?: string;
+	platform?: string;
+	configuration?: string;
+	refresh?: boolean;
+	/** Run `clangd --check` on this file after generating (acceptance gate). */
+	check?: string;
+	timeoutMs?: number;
+	onProgress?: (message: string) => void;
+	fs?: FsAdapter;
+	deps?: ResolverDeps;
+}
+
+/**
+ * Generate and normalize UBT's clangd database, then optionally prove it with `clangd --check`.
+ * Generation costs minutes (UBT regenerates the makefile and runs UHT), and the engine-wide scope
+ * is ~1 GB: this is the expensive path, and only the explicit tool call reaches it.
+ */
+export async function compileDbReport(input: CompileDbInput) {
+	const fs = input.fs ?? realFs;
+	const workspace = await resolveWorkspace(input.cwd, fs, input.deps);
+	const scope = input.scope ?? "project";
+
+	if (!workspace.engineRoot) {
+		return { ok: false, notes: [...workspace.notes, "no engine resolved, so UnrealBuildTool cannot run (see unreal_resolve_engine)"], warnings: [] as string[], entries: 0, seconds: 0, reused: false };
+	}
+	const target = input.target ?? pickDefaultTarget(discoverTargets({ projectDir: workspace.projectDir, engineRoot: workspace.engineRoot, fs }), workspace.projectName)?.name;
+	if (!target) {
+		return { ok: false, notes: [...workspace.notes, "no *.Target.cs found, so the compile database has no target to generate for"], warnings: [] as string[], entries: 0, seconds: 0, reused: false };
+	}
+
+	const include = input.include?.length ? input.include.map(normalizePath) : compileDbScope({ projectDir: workspace.projectDir, pluginDirs: workspace.pluginDirs, engineRoot: workspace.engineRoot, scope });
+	const ensured = await ensureCompileDb({
+		engineRoot: workspace.engineRoot,
+		projectPath: workspace.projectPath,
+		target,
+		platform: input.platform,
+		configuration: input.configuration,
+		include,
+		dropHeaders: true,
+		refresh: input.refresh,
+		timeoutMs: input.timeoutMs,
+		onProgress: input.onProgress,
+	});
+
+	const notes: string[] = [
+		`target ${target} (${hostPlatform()})`,
+		`scope: ${ensured.scope.join(", ")}`,
+		ensured.reused ? `reused ${ensured.path}` : `generated in ${ensured.seconds.toFixed(1)}s (raw ${ensured.rawPath ? baseName(ensured.rawPath) : "?"})`,
+		`normalized: ${ensured.stats.kept} entries (dropped ${ensured.stats.droppedPch} PCH units, ${ensured.stats.droppedHeaders} headers, ${ensured.stats.droppedSwitches} switches, expanded ${ensured.stats.expandedRsp} response files)`,
+		"point clangd at this directory with --compile-commands-dir, or copy the path into the project's .clangd; the database encodes this machine's paths, so keep it out of git",
+	];
+	let check: { ok: boolean; clangd?: string; summary: string[]; notes: string[] } | undefined;
+	if (input.check) {
+		const file = input.check.includes(":") || input.check.startsWith("/") || /^[a-z]:/i.test(input.check) ? input.check : normalizePath(joinPath(input.cwd, input.check));
+		const ran = await clangdCheck({ file, dbDir: ensured.path.replace(/\/compile_commands\.json$/, ""), timeoutMs: input.timeoutMs });
+		check = { ok: ran.ok, clangd: ran.clangd, summary: ran.summary, notes: ran.notes };
+		notes.push(...ran.notes.map((note) => `check: ${note}`));
+	}
+	return { ok: ensured.entries > 0, target, platform: input.platform ?? hostPlatform(), configuration: input.configuration ?? "Development", path: ensured.path, rawPath: ensured.rawPath, entries: ensured.entries, seconds: ensured.seconds, reused: ensured.reused, stats: ensured.stats, scope, check, notes: [...workspace.notes, ...notes], warnings: ensured.warnings };
 }

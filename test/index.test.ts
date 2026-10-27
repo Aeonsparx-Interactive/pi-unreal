@@ -197,3 +197,65 @@ describe("root assembly", () => {
 		expect(notes.join(" ")).toContain("module root");
 	});
 });
+
+/* ── compile database pipeline (clangd enrichment) ─────────────────────── */
+
+import { compileDbScope } from "../extensions/unreal/lib/tools.ts";
+import { dropHeaderEntries, expandResponseTokens, filterEntries, normalizeDatabase, stripPostPchTokens, tokenizeCommand, joinTokens, ubtCompileDbPaths } from "../extensions/unreal/lib/compiledb.ts";
+
+it("tokenizeCommand keeps quoted runs, joinTokens re-quotes paths with spaces", () => {
+	const tokens = tokenizeCommand('"C:/Program Files/LLVM/bin/clang-cl.exe" "C:/a b/F.cpp" /c /I"C:/x y"');
+	expect(tokens).toEqual(["C:/Program Files/LLVM/bin/clang-cl.exe", "C:/a b/F.cpp", "/c", "/IC:/x y"]);
+	expect(joinTokens(["C:/a b/clang-cl.exe", "C:/a b/F.cpp", "/c"])).toBe('"C:/a b/clang-cl.exe" "C:/a b/F.cpp" /c');
+});
+
+it("stripPostPchTokens drops PCH/link switches and everything after /link", () => {
+	const { tokens, dropped } = stripPostPchTokens(["clang-cl.exe", "F.cpp", "/YuSharedPCH.h", "/FpShared.pch", "/FmX.obj", "/c", "/link", "/OUT:X.dll", "/NOLOGO"]);
+	expect(tokens).toEqual(["clang-cl.exe", "F.cpp", "/c"]);
+	expect(dropped).toEqual(["/YuSharedPCH.h", "/FpShared.pch", "/FmX.obj", "/link", "/OUT:X.dll", "/NOLOGO"]);
+});
+
+it("expandResponseTokens inlines an rsp file, reporting a missing one", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-unreal-rsp-"));
+	writeFileSync(join(dir, "mod.rsp"), ["/c", '/I"C:/inc"', "/YuFILE"].join("\n"));
+	const { tokens, expanded, missing } = expandResponseTokens(["clang-cl.exe", "@mod.rsp", "F.cpp"], { baseDir: dir });
+	expect(tokens).toEqual(["clang-cl.exe", "/c", "/IC:/inc", "/YuFILE", "F.cpp"]);
+	expect(expanded).toEqual([join(dir, "mod.rsp")]);
+	expect(missing).toEqual([]);
+	const gap = expandResponseTokens(["clang-cl.exe", "@nope.rsp"], { baseDir: dir });
+	expect(gap.missing).toEqual([join(dir, "nope.rsp")]);
+	expect(gap.tokens).toEqual(["clang-cl.exe", "@nope.rsp"]);
+});
+
+it("normalizeDatabase: rsp expansion + PCH/link stripping + header drop + scope filter", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-unreal-rsp-"));
+	writeFileSync(join(dir, "proj.rsp"), ["/c", "/DPLATFORM=1"].join("\n"));
+	const entries = [
+		{ file: "C:/Proj/Source/Proj/A.cpp", directory: dir, command: "clang-cl.exe @proj.rsp C:/Proj/Source/Proj/A.cpp /link /OUT:x.obj" },
+		{ file: "C:/Proj/Source/Proj/B.h", directory: dir, command: "clang-cl.exe @proj.rsp C:/Proj/Source/Proj/B.h" },
+		{ file: "C:/E/Engine/Source/Runtime/Core/Private/Core.cpp", directory: dir, command: "clang-cl.exe @proj.rsp C:/E/Engine/Source/Runtime/Core/Private/Core.cpp" },
+		{ file: "C:/E/Engine/Source/Runtime/Core/Private/SharedPCH.Core.h.cpp", directory: dir, command: "clang-cl.exe @proj.rsp C:/E/Engine/Source/Runtime/Core/Private/SharedPCH.Core.h.cpp" },
+	];
+	const { entries: kept, stats } = normalizeDatabase(entries, { baseDir: dir, include: ["C:/Proj/Source"], dropHeaders: true });
+	expect(kept.map((e) => e.file)).toEqual(["C:/Proj/Source/Proj/A.cpp"]);
+	expect(kept[0]!.command).toContain("/c");
+	expect(kept[0]!.command).not.toContain("/link");
+	// 4 raw entries -> 1 PCH unit + 1 header dropped -> 1 survives the include filter, expanding its rsp.
+	// Stats count what the surviving entries went through, not the raw input size.
+	expect(stats).toMatchObject({ droppedPch: 1, droppedHeaders: 1, expandedRsp: 1, droppedSwitches: 2, missingRsp: [], kept: 1 });
+});
+
+it("filterEntries keeps prefix matches, ubtCompileDbPaths lists both layout spots", () => {
+	const entries = [{ file: "C:/Proj/A.cpp" }, { file: "C:/E/B.cpp" }] as never;
+	expect(filterEntries(entries, { include: ["C:/Proj"] }).map((e) => e.file)).toEqual(["C:/Proj/A.cpp"]);
+	expect(filterEntries(entries, {}).length).toBe(2);
+	const paths = ubtCompileDbPaths({ engineRoot: "C:/E", projectDir: "C:/Proj", platform: "Win64" });
+	expect(paths).toContain("C:/Proj/Intermediate/Build/Win64/UnrealBuildTool/compile_commands.json");
+	expect(paths).toContain("C:/E/Engine/Intermediate/Build/Win64/UnrealBuildTool/compile_commands.json");
+});
+
+it("compileDbScope: project + plugins, engine area added only for the engine scope", () => {
+	expect(compileDbScope({ projectDir: "C:/Proj", pluginDirs: ["C:/P1", "C:/P2"], engineRoot: "C:/E", scope: "project" })).toEqual(["C:/Proj", "C:/P1", "C:/P2"]);
+	expect(compileDbScope({ projectDir: "C:/Proj", engineRoot: "C:/E", scope: "project+engine" })).toEqual(["C:/Proj", "C:/E/Engine/Source"]);
+	expect(compileDbScope({ scope: "project" })).toEqual([]);
+});

@@ -15,7 +15,7 @@ import { Type } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 
 import { normalizePath, realFs, truncateLines, type JsonValue } from "./util.ts";
-import { buildContext, fileContext, indexBuild, indexStatus, symbolList, symbolLookup, type Scope } from "./tools.ts";
+import { buildContext, compileDbReport, fileContext, indexBuild, indexStatus, symbolList, symbolLookup, type Scope } from "./tools.ts";
 
 /* ──────────────────────────────────────────────────────────────────────────── schemas */
 
@@ -77,8 +77,8 @@ const ContextParams = Type.Object({
 
 const IndexParams = Type.Object({
 	cwd: CwdSchema,
-	action: Type.Union([Type.Literal("build"), Type.Literal("status")], { description: "'build' creates or refreshes an index. 'status' lists what is cached and what building will cost." }),
-	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("engine")], { description: "Index scope for 'build'. Default 'project' (seconds). 'engine' scans Engine/Source (minutes the first time)." })),
+	action: Type.Union([Type.Literal("build"), Type.Literal("status"), Type.Literal("compiledb")], { description: "'build' creates or refreshes an index. 'status' lists what is cached and what building will cost. 'compiledb' runs UnrealBuildTool -Mode=GenerateClangDatabase and normalizes it for clangd (minutes, ~1 GB for the engine scope)." }),
+	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("engine"), Type.Literal("project+engine")], { description: "Index scope for 'build': 'project' (default, seconds) or 'engine' (minutes the first time). For 'compiledb': 'project' (default) = project + enabled plugin sources, 'project+engine' adds all of Engine/Source." })),
 	mode: Type.Optional(Type.Union([Type.Literal("definitions"), Type.Literal("full")], { description: "'definitions' = symbol -> file:line only (default, fast). 'full' also records per-file include sets and needs UnrealBuildTool Query (~7s, no compiler)." })),
 	engineAreas: EngineAreasSchema,
 	target: TargetSchema,
@@ -305,6 +305,7 @@ export const unrealIndex = defineTool({
 		"An engine-scope build is a minutes-long scan the first time. Ask the user before building it, and prefer engineAreas [\"Runtime\"] over the whole tree when the question is about gameplay base classes.",
 		"mode 'full' runs UnrealBuildTool -Mode=Query (~7s, needs no compiler, and runs in UBT's own Query environment so it cannot collide with a live build) and records include edges; 'definitions' is a text scan only.",
 		"After a rebase, a branch switch, adding a plugin, or an engine version change, rebuild with refresh: true — indexes are keyed by scan-root identity, not by the project name.",
+		"action 'compiledb' is the clangd enrichment path: minutes of UnrealBuildTool work, ~1 GB for the engine scope. Ask the user before running it, pass check: '<file>' to prove the result with clangd --check, and treat the database as machine-local (never committed).",
 	],
 	parameters: IndexParams,
 	outputSchema: IndexOut,
@@ -326,6 +327,26 @@ export const unrealIndex = defineTool({
 			if (!out.indexes.length) lines.push("no symbol index yet — unreal_index action build scope project (seconds)");
 			const text = [...lines, ...(out.query.notes ?? []).map((n) => `· ${n}`)].join("\n");
 			return result(text, out);
+		}
+
+		if (params.action === "compiledb") {
+			const db = await compileDbReport({
+				cwd: params.cwd ?? ctx.cwd,
+				scope: (params.scope === "project+engine" ? "project+engine" : "project") as "project" | "project+engine",
+				target: params.target,
+				platform: params.platform,
+				configuration: params.configuration,
+				refresh: params.refresh,
+				fs: realFs,
+			});
+			const text = [
+				`unreal_index compiledb → ${db.ok ? "ok" : "FAILED"}`,
+				...(db.target ? [`  target ${db.target} ${db.platform ?? ""} ${db.configuration ?? ""}`] : []),
+				`  ${db.entries} clangd-ready entries${"path" in db ? ` at ${db.path}` : ""} ${db.reused ? "(reused)" : ""}`,
+				...(db.notes ?? []).map((n) => `· ${n}`),
+				...(db.warnings ?? []).map((w) => `! ${w}`),
+			].join("\n");
+			return result(text, db as unknown as Record<string, JsonValue>, !db.ok);
 		}
 
 		const out = await indexBuild({
