@@ -131,12 +131,20 @@ function engineLines(resolution: EngineResolution): string[] {
 	return lines;
 }
 
-function pluginLines(results: PluginReferenceResult[], limit: number): string[] {
+/**
+ * One line per `.uproject` reference, plus the modules that reference buys: the status alone never
+ * said which C++ a plugin contributes, so 'resolved' answered nothing about `UCharacterMoverComponent`.
+ * `index` adds the plugins the project does NOT reference: availability and reference status are
+ * different facts, and conflating them is what made 'no Mover reference' read as 'no Mover'.
+ */
+function pluginLines(results: PluginReferenceResult[], limit: number, index?: PluginIndex): string[] {
 	const lines: string[] = [];
 	const shown = results.slice(0, limit);
 	for (const result of shown) {
 		const status = result.plugin ? `${result.status} ← ${result.plugin.source}` : result.status;
-		lines.push(`  ${result.name}: ${status}`);
+		const modules = result.plugin?.modules ?? [];
+		const moduleText = modules.length ? ` · modules ${modules.map((module) => `${module.moduleName}(${module.type ?? "Runtime"})`).join(", ")}` : "";
+		lines.push(`  ${result.name}: ${status}${moduleText}`);
 		for (const note of result.notes) lines.push(`      · ${note}`);
 	}
 	if (results.length > limit) lines.push(`  … ${results.length - limit} more references (raise pluginLimit)`);
@@ -144,6 +152,12 @@ function pluginLines(results: PluginReferenceResult[], limit: number): string[] 
 	for (const result of results) counts.set(result.status, (counts.get(result.status) ?? 0) + 1);
 	const summary = [...counts.entries()].map(([status, count]) => `${count} ${status}`).join(", ");
 	lines.push(`  totals: ${summary} of ${results.length} references`);
+	if (index) {
+		const referenced = new Set(results.map((result) => result.name.toLowerCase()));
+		const free = index.entries.filter((entry) => entry.source === "Engine" && entry.enabledByDefault && !referenced.has(entry.name.toLowerCase()));
+		const names = [...new Set(free.map((entry) => entry.name))].sort((a, b) => a.localeCompare(b));
+		lines.push(`  engine plugins available with NO .uproject reference (EnabledByDefault true): ${names.length ? names.join(", ") : "none"}`);
+	}
 	return lines;
 }
 
@@ -381,7 +395,7 @@ const projectInspectTool = defineTool({
 			pluginResults.push(...resolveProjectPlugins(descriptor, built.index, resolution.version));
 			lines.push(`plugin index: ${built.index.scannedFiles} .uplugin over [${built.index.scannedDirs.join(" | ")}] (cache ${built.cache})`);
 			lines.push("plugin references:");
-			lines.push(...pluginLines(pluginResults, params.pluginLimit ?? 40));
+			lines.push(...pluginLines(pluginResults, params.pluginLimit ?? 40, pluginIndex));
 		} else {
 			lines.push(`plugin references: ${descriptor.plugins.length} declared, not resolved against disk`);
 		}
@@ -514,7 +528,7 @@ async function reportProject(args: string, ctx: ExtensionCommandContext): Promis
 		if (resolution.status !== "unresolved") {
 			const built = await getIndexFor(resolution.engineRoot, projectDirOf(descriptor), descriptor, resolution.version);
 			lines.push(`plugin index: ${built.index.scannedFiles} .uplugin (cache ${built.cache})`);
-			lines.push(...pluginLines(resolveProjectPlugins(descriptor, built.index, resolution.version), 25));
+			lines.push(...pluginLines(resolveProjectPlugins(descriptor, built.index, resolution.version), 25, built.index));
 		}
 	}
 	ctx.ui.notify(truncateLines(lines.join("\n"), 40).text, "info");

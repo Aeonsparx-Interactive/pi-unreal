@@ -15,19 +15,19 @@ import { Type } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 
 import { normalizePath, realFs, truncateLines, type JsonValue } from "./util.ts";
-import { buildContext, compileDbReport, fileContext, indexBuild, indexStatus, symbolList, symbolLookup, type Scope } from "./tools.ts";
+import { buildContext, compileDbReport, fileContext, headerReport, indexBuild, indexStatus, symbolList, symbolLookup, type Scope } from "./tools.ts";
 
 /* ──────────────────────────────────────────────────────────────────────────── schemas */
 
 const ScopeSchema = Type.Optional(
 	Type.Union([Type.Literal("project"), Type.Literal("engine"), Type.Literal("all")], {
-		description: "Which sources to search. 'project' (default) = the project's modules plus its enabled plugins. 'engine' = Engine/Source. 'all' = both.",
+		description: "Which sources to search. 'project' (default) = the project's modules plus its enabled plugins. 'engine' = Engine/Source areas + the project's enabled plugin roots (plugin-shipped types like Mover/PoseSearch live there). 'all' = both.",
 	}),
 );
 const EngineAreasSchema = Type.Optional(
 	Type.Array(Type.String(), {
 			// Must match DEFAULT_ENGINE_AREAS in lib/store.ts — the schema description is what agents read.
-		description: 'Engine/Source sub-areas for engine-scope work, e.g. ["Runtime"] or ["Runtime/Core","Runtime/CoreUObject"]. Default: ["Runtime"] (DEFAULT_ENGINE_AREAS in lib/store.ts); "Editor" and "Developer" are opt-in and roughly triple the scan.',
+		description: 'Engine scan dials, rooted at the engine install. Engine/Source areas: ["Runtime"] (default, DEFAULT_ENGINE_AREAS in lib/store.ts), ["Editor"], ["Runtime/Core"]. Engine-plugin areas: ["Plugins"] = every Engine/Plugins source tree (~2.8x the Runtime scan — this is where Mover, PoseSearch, PhysicsControl, BlendStack, SmartObjects, StateTree and GameplayAbilities live) or one subtree, e.g. ["Plugins/Animation/PhysicsControl"]. Engine-scope indexes always include the plugin roots the .uproject enables; these areas add the rest.',
 	}),
 );
 const LimitSchema = Type.Optional(Type.Number({ description: "Maximum rows to return. Default 25." }));
@@ -46,6 +46,7 @@ const SymbolParams = Type.Object({
 	engineAreas: EngineAreasSchema,
 	module: Type.Optional(Type.String({ description: "Restrict hits to one module, e.g. 'Engine'." })),
 	prefix: Type.Optional(Type.Boolean({ description: "Allow prefix matching (name families, typos). Default false: exact + qualified-member only." })),
+	substring: Type.Optional(Type.Boolean({ description: "Allow substring matching: a linear scan of the definition table (rank 3, listed after exact/prefix hits). Finds qualified members like 'PhysicsControlBPLibrary:Enable' from a bare 'Enable'. Costs ~0.3s per 76 MB of rows. Default false." })),
 	limit: LimitSchema,
 });
 
@@ -65,8 +66,8 @@ const ListParams = Type.Object({
 
 const ContextParams = Type.Object({
 	cwd: CwdSchema,
-	file: Type.Optional(Type.String({ description: "Source file to describe (.h/.cpp in the project, a plugin, or Engine/Source): its module, declarations, include paths, defines file." })),
-	module: Type.Optional(Type.String({ description: "Module to describe instead of a file, e.g. 'GameplayAbilities' — dependency lists, include paths, defines file, standard, SDK." })),
+	file: Type.Optional(Type.String({ description: "Source file to describe (.h/.cpp in the project, a plugin, Engine/Source, or Engine/Plugins): its module, declarations, include paths, defines file." })),
+	module: Type.Optional(Type.String({ description: "Module to describe instead of a file, e.g. 'GameplayAbilities' — dependency lists, include paths, defines file, standard, SDK, and whether the target's module graph contains it." })),
 	target: TargetSchema,
 	platform: PlatformSchema,
 	configuration: ConfigurationSchema,
@@ -78,9 +79,10 @@ const ContextParams = Type.Object({
 
 const IndexParams = Type.Object({
 	cwd: CwdSchema,
-	action: Type.Union([Type.Literal("build"), Type.Literal("status"), Type.Literal("compiledb")], { description: "'build' creates or refreshes an index. 'status' lists what is cached and what building will cost. 'compiledb' runs UnrealBuildTool -Mode=GenerateClangDatabase and normalizes it for clangd (minutes, ~1 GB for the engine scope)." }),
-	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("engine"), Type.Literal("project+engine")], { description: "Index scope for 'build': 'project' (default, seconds) or 'engine' (minutes the first time). For 'compiledb': 'project' (default) = project + enabled plugin sources, 'project+engine' adds all of Engine/Source." })),
+	action: Type.Union([Type.Literal("build"), Type.Literal("status"), Type.Literal("headers"), Type.Literal("compiledb")], { description: "'build' creates or refreshes a symbol index. 'status' lists what is cached, what each index covers by root kind, and what building will cost. 'headers' builds the path-only header index and answers 'does this header exist in this engine version' (walks file paths, no content read: seconds). 'compiledb' runs UnrealBuildTool -Mode=GenerateClangDatabase and normalizes it for clangd (minutes, ~1 GB for the engine scope)." }),
+	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("engine"), Type.Literal("project+engine")], { description: "Index scope for 'build': 'project' (default, seconds) or 'engine' (Engine/Source areas + the project's enabled plugin roots; minutes the first time). For 'headers': 'engine' (default) = engine sources + every Engine/Plugins tree, 'project' = project + its plugins, 'project+engine' = both. For 'compiledb': 'project' (default) = project + enabled plugin sources, 'project+engine' adds all of Engine/Source and Engine/Plugins." })),
 	mode: Type.Optional(Type.Union([Type.Literal("definitions"), Type.Literal("full")], { description: "'definitions' = symbol -> file:line only (default, fast). 'full' also records per-file include sets and needs UnrealBuildTool Query (~7s, no compiler)." })),
+	name: Type.Optional(Type.String({ description: "For action 'headers': the header to answer, e.g. 'MoverState.h', 'PhysicsControlComponent.h', or a partial path 'Mover/Public/MoverTypes.h'. Absent = build/report only." })),
 	engineAreas: EngineAreasSchema,
 	target: TargetSchema,
 	platform: PlatformSchema,
@@ -135,11 +137,24 @@ const DefRowOut = Type.Object({
 	rank: Type.Number(),
 	match: Type.String(),
 });
-const IndexRefOut = Type.Object({ key: Type.String(), scope: Type.String(), defs: Type.Number(), generatedAt: Type.Number() });
+const IndexRefOut = Type.Object({ key: Type.String(), scope: Type.String(), defs: Type.Number(), files: Type.Optional(Type.Number()), generatedAt: Type.Number() });
 
-const SymbolOut = Type.Object({ scope: Type.String(), total: Type.Number(), results: Type.Array(DefRowOut), ranks: LooseList, indexes: Type.Array(IndexRefOut), notes: Strings, warnings: Type.Optional(Strings) });
+const SymbolOut = Type.Object({ scope: Type.String(), total: Type.Number(), results: Type.Array(DefRowOut), ranks: LooseList, indexes: Type.Array(IndexRefOut), coverage: Type.Optional(LooseList), notes: Strings, warnings: Type.Optional(Strings) });
 const ListOut = Type.Object({ scope: Type.String(), total: Type.Number(), symbols: Type.Array(DefRowOut), indexes: Type.Array(IndexRefOut), notes: Strings, warnings: Type.Optional(Strings) });
-const ContextOut = Type.Object({ unit: Loose, counts: Loose, source: Type.String(), warnings: Type.Optional(Strings), notes: Type.Optional(Strings) });
+const ContextOut = Type.Object({
+	unit: Loose,
+	counts: Loose,
+	source: Type.String(),
+	availability: Type.Optional(Loose),
+	headerOnly: Type.Optional(Type.Boolean()),
+	headerKind: Type.Optional(Type.String()),
+	pluginName: Type.Optional(Type.String()),
+	pluginSource: Type.Optional(Type.String()),
+	enabledByDefault: Type.Optional(Type.Boolean()),
+	referencedInUproject: Type.Optional(Type.Boolean()),
+	warnings: Type.Optional(Strings),
+	notes: Type.Optional(Strings),
+});
 const IndexOut = Type.Object({
 	key: Type.Optional(Type.String()),
 	mode: Type.Optional(Type.String()),
@@ -161,6 +176,14 @@ const IndexOut = Type.Object({
 	notes: Type.Optional(Strings),
 	status: Type.Optional(Loose),
 	indexes: Type.Optional(LooseList),
+	headers: Type.Optional(LooseList),
+	rootKinds: Type.Optional(Type.String()),
+	coverage: Type.Optional(LooseList),
+	files: Type.Optional(Type.Number()),
+	exists: Type.Optional(Type.Boolean()),
+	name: Type.Optional(Type.String()),
+	found: Type.Optional(LooseList),
+	candidates: Type.Optional(LooseList),
 });
 
 /* ──────────────────────────────────────────────────────────────────────────── tools */
@@ -168,12 +191,13 @@ const IndexOut = Type.Object({
 export const unrealSymbol = defineTool({
 	name: "unreal_symbol",
 	label: "UE symbol",
-	description: "Find where a C++ type, function, USTRUCT, UENUM or UPROPERTY is defined — project and enabled plugins by default, Engine/Source on request — one line per hit with its owning module.",
+	description: "Find where a C++ type, function, USTRUCT, UENUM or UPROPERTY is defined — project and enabled plugins by default, Engine/Source plus enabled plugin roots on request — one line per hit with its owning module.",
 	promptSnippet: "Locate a UE C++ symbol definition (project, plugins, engine) with module attribution",
 	promptGuidelines: [
 		"Use unreal_symbol instead of grepping Engine/Source for a class or function name: grep returns every file that mentions the name (a hot engine class is ~176 files / 150 KB of context); this returns definition lines only.",
-		"Default scope is 'project' (project modules + enabled plugins). Engine types (AActor, UAnimInstance, FWorldDelegates) need scope 'engine', which requires an engine index: unreal_index action build scope engine — minutes the first time, cached afterwards, and engineAreas [\"Runtime\"] makes it much cheaper.",
-		"Qualify member lookups: query 'Tick' with owner 'AActor', or query 'AActor:Tick'. Use prefix: true for name families ('ULp', 'ANiMy'), never to silently accept a typo.",
+		"Default scope is 'project' (project modules + enabled plugins). Engine types (AActor, UAnimInstance, FWorldDelegates) need scope 'engine', which requires an engine index: unreal_index action build scope engine — minutes the first time, cached afterwards, engineAreas [\"Runtime\"] keeps it to the engine's own sources. An engine index covers Engine/Source areas plus the plugin roots the .uproject enables; types shipped by plugins the project does NOT reference (PhysicsControl, BlendStack, StateTree, GameplayAbilities...) need engineAreas [\"Plugins\"].",
+		"Qualify member lookups: query 'Tick' with owner 'AActor', or query 'AActor:Tick'. Use prefix: true for name families ('ULp', 'ANiMy') and substring: true for qualified members ('Enable' finds 'UPhysicsControlBPLibrary:Enable'), never to silently accept a typo.",
+		"A 0-row answer is a statement about the roots that were scanned, not about the engine: read the coverage lines it prints. Asking whether a header exists in this engine version is a path question — use unreal_index action 'headers' name 'X.h', not a symbol lookup.",
 		"A definition line is a starting point, not an answer: read that file at that line. For engine call graphs clangd (MCP) is more precise; for module/link facts use unreal_context.",
 	],
 	parameters: SymbolParams,
@@ -183,7 +207,7 @@ export const unrealSymbol = defineTool({
 
 	async execute(_id, params, _signal, _update, ctx) {
 		const query = params.owner ? `${params.owner}:${params.query}` : params.query;
-		const out = await symbolLookup({ cwd: params.cwd ?? ctx.cwd, query, scope: params.scope as Scope | undefined, engineAreas: params.engineAreas, module: params.module, prefix: params.prefix, limit: params.limit, fs: realFs });
+		const out = await symbolLookup({ cwd: params.cwd ?? ctx.cwd, query, scope: params.scope as Scope | undefined, engineAreas: params.engineAreas, module: params.module, prefix: params.prefix, substring: params.substring, limit: params.limit, fs: realFs });
 		const rows = out.results.map((row) => rowLine(row, params.cwd ?? ctx.cwd));
 		const text = [`unreal_symbol '${query}' scope=${out.scope}: ${out.total} definition(s)`, ...rows, ...out.notes.map((n) => `· ${n}`), ...(out.warnings ?? []).map((w) => `! ${w}`)].join("\n");
 		return result(text, out, out.total === 0);
@@ -299,14 +323,15 @@ export const unrealContext = defineTool({
 export const unrealIndex = defineTool({
 	name: "unreal_index",
 	label: "UE index",
-	description: "Build or report the source index: project/plugins (seconds), Engine/Source (minutes the first time), and the UnrealBuildTool Query cache behind the compile facts.",
-	promptSnippet: "Build/report the UE symbol index and UBT Query cache",
+	description: "Build or report the source index: project/plugins (seconds), Engine/Source plus enabled plugin roots (minutes the first time), the path-only header index that answers 'does this header exist', and the UnrealBuildTool Query cache behind the compile facts.",
+	promptSnippet: "Build/report the UE symbol index, header index, and UBT Query cache",
 	promptGuidelines: [
-		"Run unreal_index action 'status' first: it prints what is cached, how old it is, and what building will cost.",
-		"An engine-scope build is a minutes-long scan the first time. Ask the user before building it, and prefer engineAreas [\"Runtime\"] over the whole tree when the question is about gameplay base classes.",
+		"Run unreal_index action 'status' first: it prints what is cached, how old it is, which root kinds each index covers, and what building will cost. A 0 from a lookup is only meaningful against the index status names — an index key encodes its root set, so an index you did not build is not what was searched.",
+		"An engine-scope build is a minutes-long scan the first time. Ask the user before building it, and prefer engineAreas [\"Runtime\"] over the whole tree when the question is about gameplay base classes; engineAreas [\"Plugins\"] is the dial for plugin-shipped types (~2.8x the Runtime scan), [\"Plugins/Animation/PhysicsControl\"] for one plugin.",
+		"action 'headers' answers 'does this header exist in this engine version': a path walk only (no content read, seconds, cached), scoped by root kind and reporting the owning plugin, its EnabledByDefault and its .uproject status. Invented header names come back as NOT a file path plus the closest real file names, never as types.",
 		"mode 'full' runs UnrealBuildTool -Mode=Query (~7s, needs no compiler, and runs in UBT's own Query environment so it cannot collide with a live build) and records include edges; 'definitions' is a text scan only.",
 		"After a rebase, a branch switch, adding a plugin, or an engine version change, rebuild with refresh: true — indexes are keyed by scan-root identity, not by the project name.",
-		"action 'compiledb' is the clangd enrichment path: minutes of UnrealBuildTool work, ~1 GB for the engine scope. Ask the user before running it, pass check: '<file>' to prove the result with clangd --check, and treat the database as machine-local (never committed).",
+		"action 'compiledb' is the clangd enrichment path: minutes of UnrealBuildTool work, ~1 GB for the engine scope (project+engine now includes Engine/Plugins sources, which is where plugin .cpp bodies live). Ask the user before running it, pass check: '<file>' to prove the result with clangd --check, and treat the database as machine-local (never committed).",
 	],
 	parameters: IndexParams,
 	outputSchema: IndexOut,
@@ -324,10 +349,35 @@ export const unrealIndex = defineTool({
 			];
 			for (const index of out.indexes) {
 				lines.push(`index ${index.key}  ${index.scope || "?"} ${index.mode}  ${index.defs} symbols / ${index.files} files  ${index.source}${index.target ? ` target=${index.target}` : ""}  ${Math.round(index.ageMs / 1000)}s old  ${index.sizeMb}MB${index.issues.length ? `  issues: ${index.issues.join("; ")}` : ""}`);
+				lines.push(`  covers ${index.coverage}${index.areas?.length ? `  engineAreas: ${index.areas.join(", ")}` : ""}`);
 			}
 			if (!out.indexes.length) lines.push("no symbol index yet — unreal_index action build scope project (seconds)");
-			const text = [...lines, ...(out.query.notes ?? []).map((n) => `· ${n}`)].join("\n");
+			for (const header of out.headers) {
+				lines.push(`header index ${header.key}  ${header.files} header paths from ${header.roots} roots (${header.coverage})${header.areas?.length ? `  areas: ${header.areas.join(", ")}` : ""}  ${Math.round(header.ageMs / 1000)}s old  ${header.sizeMb}MB${header.issues.length ? `  issues: ${header.issues.join("; ")}` : ""}`);
+			}
+			if (!out.headers.length) lines.push('no header index yet — unreal_index action headers builds the path-only index (seconds, no content scan) and answers "does this header exist in this engine version"');
+			const text = [...lines, ...out.notes.map((n) => `· ${n}`), ...(out.query.notes ?? []).map((n) => `· ${n}`)].join("\n");
 			return result(text, out);
+		}
+
+		if (params.action === "headers") {
+			const out = await headerReport({
+				cwd: params.cwd ?? ctx.cwd,
+				name: params.name,
+				scope: (params.scope === "project" ? "project" : params.scope === "project+engine" ? "all" : "engine") as "project" | "engine" | "all",
+				build: true,
+				engineAreas: params.engineAreas,
+				refresh: params.refresh,
+				fs: realFs,
+			});
+			const lines = [`unreal_index headers${out.key ? ` → ${out.key}` : ""}`, `  ${out.files} header paths from ${out.roots} roots (${out.rootKinds})${out.built ? "" : "  not built"}`];
+			if (out.name) {
+				lines.push(`  '${out.name}': ${out.exists ? "EXISTS" : "does NOT exist as a file path in this engine version"}`);
+				for (const row of out.found) lines.push(`    ${row.file}  [${row.module}${row.plugin ? ` · plugin ${row.plugin} [${row.pluginSource}] EnabledByDefault ${row.enabledByDefault} · .uproject reference ${row.referencedInUproject ? "yes" : "NO"}` : ""}]`);
+				if (out.candidates.length) lines.push(`  closest real file names (files, not types):\n${out.candidates.map((row) => `    ${row.file}  [${row.module}]`).join("\n")}`);
+			}
+			const text = [...lines, ...out.notes.map((n) => `· ${n}`), ...(out.warnings ?? []).map((w) => `! ${w}`)].join("\n");
+			return result(text, out as unknown as Record<string, JsonValue>, Boolean(out.name) && !out.exists);
 		}
 
 		if (params.action === "compiledb") {
