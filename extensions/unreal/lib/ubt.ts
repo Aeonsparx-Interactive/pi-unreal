@@ -53,6 +53,12 @@ export interface UbtModuleRefs {
 	shortName: string;
 	moduleDirectory: string;
 	intermediateDirectory: string;
+	/**
+	 * `Type` from the Query JSON when present (TargetModuleReferences in some engine versions carries
+	 * it; the .uplugin/.Build.cs value is the fallback source). `unreal_context` prints it because
+	 * 'Runtime' vs 'Editor' vs 'External' is what tells you whether a game target can link the module.
+	 */
+	type: string;
 	public: string[];
 	private: string[];
 	publicInclude: string[];
@@ -348,6 +354,7 @@ export function parseModuleReferences(json: unknown): Map<string, UbtModuleRefs>
 			shortName: typeof value.shortName === "string" ? value.shortName : "",
 			moduleDirectory: normalizePath((value.moduleDirectory as string) ?? ""),
 			intermediateDirectory: normalizePath((value.intermediateDirectory as string) ?? ""),
+			type: typeof value.Type === "string" ? (value.Type as string) : typeof value.type === "string" ? (value.type as string) : "",
 			public: asStrings(value.public),
 			private: asStrings(value.private),
 			publicInclude: asStrings(value.publicInclude),

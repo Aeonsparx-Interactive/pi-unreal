@@ -23,19 +23,32 @@
  * for the project, one per target) and the answer depends on which one was read.
  */
 
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
+import { createInterface } from "node:readline";
 import { cacheDir } from "./cache.ts";
 import { normalizePath, joinPath, shortHash, baseName, realFs, type FsAdapter } from "./util.ts";
 import { collectSourceFiles, scanText, type IncludeRef, type ScanRoot, type SymbolDef } from "./scan.ts";
 import { parseModuleReferences, parseTargetDetails, readQueryJson, type UbtModuleRefs, type UbtModuleSettings } from "./ubt.ts";
 
-export const INDEX_VERSION = 5;
+/**
+ * v6: `meta.rootKinds` (what an index actually covers, by root kind) and `meta.areas`, and engine-scope
+ * indexes now include the project's enabled plugin roots, so engine-scope keys change and v5 engine
+ * indexes are not reused. v5 was the TSV layout change; older indexes are unreadable by design.
+ */
+export const INDEX_VERSION = 6;
 
 /**
- * Default engine scan. `Runtime` is where gameplay types live (AActor, UAnimInstance,
- * UGameModeBase) and is what project questions actually touch: measured 6,212 files / 126,350
- * definitions in 34 s on a UE 5.8 install. `Editor` and `Developer` roughly triple that, so they
- * are opt-in through `engineAreas`.
+ * Default engine scan. `Runtime` is where the **engine's own** gameplay types live (AActor,
+ * UAnimInstance, UGameModeBase): measured 6,212 files / 126,350 definitions in 34 s on a UE 5.8
+ * install. `Editor` and `Developer` roughly triple that, so they are opt-in through `engineAreas`.
+ *
+ * It is NOT the whole engine: most UE-facing types shipped as engine *plugins* (Mover, PoseSearch,
+ * PhysicsControl, BlendStack, SmartObjects, StateTree, GameplayAbilities, GameplayStateTree, …) live
+ * under Engine/Plugins/<category>/<plugin>/Source/<module>, which `"Runtime"` does not touch. Engine-scope
+ * indexes therefore add the plugin roots the project enables (free — already computed), and
+ * `engineAreas: ["Plugins"]` (or `["Plugins/Animation/PhysicsControl"]`) dials in the rest. Measured on
+ * UE 5.8: Engine/Source/Runtime is 18,681 scannable files, all plugin sources are 52,568 (~2.8x).
  */
 export const DEFAULT_ENGINE_AREAS = ["Runtime"];
 
@@ -61,6 +74,10 @@ export interface IndexMeta {
 	configuration?: string;
 	counts: { files: number; symbols: number; includes: number; modules: number };
 	defsByKind: Record<string, number>;
+	/** Root provenance by kind — the coverage claim a 0-row answer is bounded by (see `classifyRoot`). */
+	rootKinds?: Record<string, number>;
+	/** `engineAreas` the engine half was scanned with, when an engine half exists. */
+	areas?: string[];
 	warnings: string[];
 	sizeBytes: number;
 	defsPath: string;
@@ -97,6 +114,44 @@ export interface IndexBuild {
 }
 
 export type DefRow = { symbol: string; kind: string; file: string; line: number; module: string; scope: string; marker: string };
+
+/* ──────────────────────────────────────────────────────────────────── root kinds */
+
+/**
+ * What kind of source a scan root is. This is the vocabulary every coverage claim is written in:
+ * `unreal_symbol scope: "engine"` answers for `engine-source` + `engine-plugin` roots, and nothing
+ * else — a 0-row answer is only a statement about the roots that were scanned.
+ */
+export type RootKind = "project" | "engine-plugin" | "engine-source" | "other-plugin";
+
+export function classifyRoot(root: string, options: { projectRoot?: string; engineRoot?: string } = {}): RootKind {
+	const r = normalizePath(root).toLowerCase();
+	const project = options.projectRoot ? normalizePath(options.projectRoot).toLowerCase() : undefined;
+	const engine = options.engineRoot ? normalizePath(options.engineRoot).toLowerCase() : undefined;
+	if (project && (r === project || r.startsWith(`${project}/`))) return "project";
+	if (engine && r.startsWith(`${engine}/`)) {
+		if (r.includes("/engine/plugins/")) return "engine-plugin";
+		if (r.includes("/engine/source/")) return "engine-source";
+		return "other-plugin";
+	}
+	return "other-plugin";
+}
+
+/** Root counts by kind, most numerous first. Drives index-status coverage lines and 0-row caveats. */
+export function summarizeRootKinds(roots: string[], options: { projectRoot?: string; engineRoot?: string } = {}): { kind: RootKind; count: number }[] {
+	const counts = new Map<RootKind, number>();
+	for (const root of roots) {
+		const kind = classifyRoot(root, options);
+		counts.set(kind, (counts.get(kind) ?? 0) + 1);
+	}
+	return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([kind, count]) => ({ kind, count }));
+}
+
+/** One-line coverage phrase, e.g. `1 project root, 62 engine-plugin roots`. */
+export function rootKindsNote(roots: string[], options: { projectRoot?: string; engineRoot?: string } = {}): string {
+	const parts = summarizeRootKinds(roots, options).map((entry) => `${entry.count} ${entry.kind} root(s)`);
+	return parts.length ? parts.join(", ") : "no roots";
+}
 
 /**
  * Provenance of a set of scan roots. Plugin module directories inside an installed engine tree count as
@@ -156,6 +211,109 @@ function byProbe(a: DefRow, b: DefRow): number {
 	return a.line - b.line;
 }
 
+/** Rows per sorted shard. 40 000 rows ≈ 5 MB of live objects; a whole-Plugins scan spills ~43. */
+const SHARD_ROWS = 40_000;
+
+/** One def row in `defs.tsv` cell order (shared by the shard writer and the merge). */
+function defLine(row: DefRow): string {
+	return [esc(row.symbol), row.kind, esc(row.file), row.line, esc(row.module), esc(row.scope), esc(row.marker)].join("\t");
+}
+
+/** Plain-string key that reproduces `byProbe` order: probe(symbol), file, then line (zero-padded). */
+function defSortKey(line: string): string {
+	const cells = line.split("\t");
+	return `${probe(unesc(cells[0] ?? ""))}\t${unesc(cells[2] ?? "")}\t${String(Number(cells[3]) || 0).padStart(12, "0")}`;
+}
+
+/** Buffered append-only TSV writer (a whole file is never built as one string). */
+class TsvStreamWriter {
+	private fd: number;
+	private lines: string[] = [];
+	bytes = 0;
+
+	constructor(readonly path: string) {
+		mkdirSync(baseDirOf(path), { recursive: true });
+		this.fd = openSync(path, "w");
+	}
+
+	write(line: string): void {
+		this.lines.push(line);
+		if (this.lines.length >= 8192) this.flush();
+	}
+
+	private flush(): void {
+		if (!this.lines.length) return;
+		const buffer = Buffer.from(`${this.lines.join("\n")}\n`, "utf8");
+		this.lines = [];
+		let offset = 0;
+		while (offset < buffer.length) offset += writeSync(this.fd, buffer, offset, buffer.length - offset);
+		this.bytes += buffer.length;
+	}
+
+	close(): void {
+		this.flush();
+		closeSync(this.fd);
+	}
+}
+
+/**
+ * K-way merge of sorted shard files into one sorted TSV stream.
+ *
+ * Each shard is read lazily (one readline iterator per shard, one live line each), so memory is
+ * O(shards), and a min-heap over the shard heads keeps the merge at O(rows · log shards).
+ */
+async function mergeSortedShards(shardPaths: string[], out: TsvStreamWriter): Promise<void> {
+	const streams = shardPaths.map((path) => createInterface({ input: createReadStream(path), crlfDelay: Infinity })[Symbol.asyncIterator]());
+	const heads: ({ key: string; line: string } | undefined)[] = streams.map(() => undefined);
+	const alive: number[] = [];
+	const pull = async (shard: number): Promise<void> => {
+		const next = await streams[shard]!.next();
+		heads[shard] = next.done || !next.value ? undefined : { key: defSortKey(next.value), line: next.value };
+	};
+	const keyAt = (slot: number) => heads[alive[slot]!]!.key;
+	const swap = (a: number, b: number) => {
+		const tmp = alive[a]!;
+		alive[a] = alive[b]!;
+		alive[b] = tmp;
+	};
+	const siftDown = (from: number) => {
+		let i = from;
+		for (;;) {
+			const left = 2 * i + 1;
+			const right = left + 1;
+			let best = i;
+			if (left < alive.length && keyAt(left) < keyAt(best)) best = left;
+			if (right < alive.length && keyAt(right) < keyAt(best)) best = right;
+			if (best === i) return;
+			swap(i, best);
+			i = best;
+		}
+	};
+	for (let shard = 0; shard < streams.length; shard++) {
+		await pull(shard);
+		if (heads[shard]) alive.push(shard);
+	}
+	for (let slot = (alive.length >> 1) - 1; slot >= 0; slot--) siftDown(slot);
+	while (alive.length) {
+		const shard = alive[0]!;
+		const head = heads[shard]!;
+		out.write(head.line);
+		await pull(shard);
+		if (!heads[shard]) {
+			// This shard is exhausted: move the last live shard to the root slot and shrink the heap.
+			alive[0] = alive[alive.length - 1]!;
+			alive.pop();
+		}
+		if (alive.length) siftDown(0);
+	}
+	for (const stream of streams) await stream.return?.(undefined);
+}
+
+function baseDirOf(path: string): string {
+	const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+	return cut <= 0 ? path : path.slice(0, cut);
+}
+
 export async function buildIndex(input: {
 	key: string;
 	mode: "definitions" | "full";
@@ -168,9 +326,16 @@ export async function buildIndex(input: {
 	platform?: string;
 	configuration?: string;
 	queryFiles?: { targetDetails: string; moduleReferences: string };
+	/** Recorded verbatim in `meta.areas` so status can state what an engine index scanned. */
+	areas?: string[];
 	/** Where the ScanRoot provenance comes from; `deriveScope(roots)` when omitted. */
 	scope?: IndexScope;
 	concurrency?: number;
+	/**
+	 * Rows per sorted shard (default `SHARD_ROWS`). Exposed for tests: a whole-Plugins scan spills ~43
+	 * shards and 1.24 M rows, and a merge bug is invisible at the production size.
+	 */
+	shardRows?: number;
 }): Promise<IndexBuild> {
 	const started = Date.now();
 	const dir = indexDir(input.key);
@@ -187,11 +352,41 @@ export async function buildIndex(input: {
 		return moduleFromBuildCs(file);
 	};
 
+	const rootDirs = input.roots.map((root) => root.dir);
+	const rootKinds: Record<string, number> = {};
+	for (const entry of summarizeRootKinds(rootDirs, { projectRoot: input.projectRoot, engineRoot: input.engineRoot })) {
+		rootKinds[entry.kind] = entry.count;
+	}
+
 	const files = await collectSourceFiles(input.roots, { concurrency: input.concurrency });
-	const rows: DefRow[] = [];
-	const fileRows: string[] = [];
-	const includeRows: string[] = [];
-	const byFileIncludes = new Map<string, string[]>();
+	// Streaming write: a whole-Plugins engine index is ~1.7 M definition rows (~300 MB of TSV), and
+	// accumulating them in an array before one giant sort was the OOM. Rows are sorted per shard and
+	// the shards are merged, so peak memory is one shard, and defs.tsv is byte-identical to a sorted
+	// single-pass write.
+	const shardDir = joinPath(dir, "shards");
+	const shardRows = Math.max(1, input.shardRows ?? SHARD_ROWS);
+	rmSync(shardDir, { recursive: true, force: true });
+	mkdirSync(shardDir, { recursive: true });
+	const shardPaths: string[] = [];
+	let batch: DefRow[] = [];
+	let rowTotal = 0;
+	const flushBatch = () => {
+		if (!batch.length) return;
+		batch.sort(byProbe);
+		const shardPath = joinPath(shardDir, `shard-${String(shardPaths.length).padStart(4, "0")}.tsv`);
+		const shard = new TsvStreamWriter(shardPath);
+		for (const row of batch) shard.write(defLine(row));
+		shard.close();
+		shardPaths.push(shardPath);
+		rowTotal += batch.length;
+		batch = [];
+	};
+	const filesOut = new TsvStreamWriter(joinPath(dir, "files.tsv"));
+	filesOut.write("file\tmodule\tkind\tsymbols");
+	const includesOut = input.mode === "full" ? new TsvStreamWriter(joinPath(dir, "includes.tsv")) : undefined;
+	includesOut?.write("file\tmodule\tincludes\tsymbols");
+	let fileTotal = 0;
+	let includeTotal = 0;
 	const modules = new Set<string>();
 	const defsByKind: Record<string, number> = {};
 
@@ -206,19 +401,26 @@ export async function buildIndex(input: {
 		const { defs, includes } = scanText(text, entry.abs, module, entry.root.scope);
 		modules.add(module);
 		for (const def of defs) {
-			rows.push({ symbol: def.symbol, kind: def.kind, file: def.file, line: def.line, module: def.module, scope: def.scope, marker: def.marker });
+			batch.push({ symbol: def.symbol, kind: def.kind, file: def.file, line: def.line, module: def.module, scope: def.scope, marker: def.marker });
 			defsByKind[def.kind] = (defsByKind[def.kind] ?? 0) + 1;
 		}
-		fileRows.push(`${esc(entry.abs)}\t${esc(module)}\t${fileKindLabel(entry.abs)}\t${defs.length}`);
-		if (input.mode === "full") includeRows.push(`${esc(entry.abs)}\t${esc(module)}\t${includes.map((inc) => (inc.angled ? `<${inc.target}>` : `"${inc.target}"`)).join(",")}\t${defs.map((def) => def.symbol).join(",")}`);
+		if (batch.length >= shardRows) flushBatch();
+		fileTotal++;
+		filesOut.write(`${esc(entry.abs)}\t${esc(module)}\t${fileKindLabel(entry.abs)}\t${defs.length}`);
+		if (includesOut) {
+			includeTotal++;
+			includesOut.write(`${esc(entry.abs)}\t${esc(module)}\t${includes.map((inc) => (inc.angled ? `<${inc.target}>` : `"${inc.target}"`)).join(",")}\t${defs.map((def) => def.symbol).join(",")}`);
+		}
 	}
+	flushBatch();
+	filesOut.close();
+	includesOut?.close();
 
-	rows.sort(byProbe);
-
-	const defsTsv = `${TSV_HEADER.join("\t")}\n${rows.map((r) => [esc(r.symbol), r.kind, esc(r.file), r.line, esc(r.module), esc(r.scope), esc(r.marker)].join("\t")).join("\n")}\n`;
-	writeTextAtomic(joinPath(dir, "defs.tsv"), defsTsv);
-	writeTextAtomic(joinPath(dir, "files.tsv"), `file\tmodule\tkind\tsymbols\n${fileRows.join("\n")}\n`);
-	if (input.mode === "full") writeTextAtomic(joinPath(dir, "includes.tsv"), `file\tmodule\tincludes\tsymbols\n${includeRows.join("\n")}\n`);
+	const defsOut = new TsvStreamWriter(joinPath(dir, "defs.tsv"));
+	defsOut.write(TSV_HEADER.join("\t"));
+	await mergeSortedShards(shardPaths, defsOut);
+	defsOut.close();
+	rmSync(shardDir, { recursive: true, force: true });
 
 	const meta: IndexMeta = {
 		version: INDEX_VERSION,
@@ -235,10 +437,12 @@ export async function buildIndex(input: {
 		target: input.target,
 		platform: input.platform,
 		configuration: input.configuration,
-		counts: { files: fileRows.length, symbols: rows.length, includes: includeRows.length, modules: modules.size },
+		counts: { files: fileTotal, symbols: rowTotal, includes: includeTotal, modules: modules.size },
 		defsByKind,
+		rootKinds,
+		areas: input.areas,
 		warnings,
-		sizeBytes: Buffer.byteLength(defsTsv, "utf8"),
+		sizeBytes: defsOut.bytes,
 		defsPath: normalizePath(joinPath(dir, "defs.tsv")),
 		filesPath: normalizePath(joinPath(dir, "files.tsv")),
 		includesPath: input.mode === "full" ? normalizePath(joinPath(dir, "includes.tsv")) : undefined,
@@ -253,6 +457,10 @@ export async function buildIndex(input: {
  * Re-scan only the files a caller names (an agent that just edited three files), merging rows into
  * the existing TSV. Kept as a whole-file rewrite: 69 MB rewritten in ~1 s is cheaper than a
  * patchable index format, and the result is always consistent.
+ *
+ * Memory-bound by design: `readDefRows` materializes the whole table. Safe for project and
+ * engine-area indexes; do not run it against a whole-`Engine/Plugins` index (~1.24 M rows, ~300 MB),
+ * which is why no tool exposes it.
  */
 export async function patchIndex(index: IndexState, files: string[], resolveModule: (file: string) => { module: string; scope: IndexScope }): Promise<{ updated: number; added: number; removed: number }> {
 	const rows = readDefRows(index);
@@ -298,10 +506,17 @@ function lineOffsets(path: string): { offsets: number[]; size: number } {
 	if (cached && cached.size === size) return cached;
 	const fd = openSync(path, "r");
 	try {
-		const buffer = Buffer.alloc(size);
-		const read = readSync(fd, buffer, 0, size, 0);
+		// Chunked: a whole-Plugins defs.tsv is ~300 MB, and reading it into one Buffer to count
+		// newlines is a 300 MB allocation on the first lookup against it.
+		const buffer = Buffer.alloc(1 << 22);
 		const offsets: number[] = [0];
-		for (let i = 0; i < read; i++) if (buffer[i] === 0x0a) offsets.push(i + 1);
+		let position = 0;
+		for (;;) {
+			const read = readSync(fd, buffer, 0, buffer.length, position);
+			if (read <= 0) break;
+			for (let i = 0; i < read; i++) if (buffer[i] === 0x0a) offsets.push(position + i + 1);
+			position += read;
+		}
 		const entry = { offsets, size };
 		lineIndexCache.set(path, entry);
 		return entry;
@@ -346,6 +561,63 @@ export function readTsv(text: string, numericColumn = -1): Record<string, string
 
 function readDefRows(index: IndexState): DefRow[] {
 	return readTsv(readFileSync(index.meta.defsPath, "utf8"), 3) as unknown as DefRow[];
+}
+
+/**
+ * Stream one TSV file line by line, 4 MB at a time, and stop when a callback returns false.
+ *
+ * Every whole-file pass used to call `readDefRows`, which materializes a 76 MB index as one string
+ * and then as an array of row objects. On the engine + every-plugin scope (~1.7 M rows, ~300 MB)
+ * that is what died in the allocator, so the linear passes stream instead: bounded memory, and the
+ * file is never fully resident.
+ */
+export function forEachTsvLine(path: string, onCells: (cells: string[]) => boolean | void): void {
+	const decoder = new StringDecoder("utf8");
+	const fd = openSync(path, "r");
+	const buffer = Buffer.alloc(1 << 22);
+	let pending = "";
+	let start = 0;
+	try {
+		for (;;) {
+			const read = readSync(fd, buffer, 0, buffer.length, null);
+			if (read <= 0) break;
+			pending += decoder.write(buffer.subarray(0, read));
+			let nl = pending.indexOf("\n", start);
+			while (nl >= 0) {
+				const line = pending.slice(start, nl);
+				start = nl + 1;
+				if (line.length && onCells(line.split("\t")) === false) return;
+				nl = pending.indexOf("\n", start);
+			}
+			if (start > (1 << 21)) {
+				pending = pending.slice(start);
+				start = 0;
+			}
+		}
+		pending += decoder.end();
+		const tail = pending.slice(start);
+		if (tail.length) onCells(tail.split("\t"));
+	} finally {
+		closeSync(fd);
+	}
+}
+
+function defRowFromCells(cells: string[]): DefRow | undefined {
+	if (cells.length < 7) return undefined;
+	return { symbol: unesc(cells[0] ?? ""), kind: cells[1] ?? "", file: unesc(cells[2] ?? ""), line: Number(cells[3]), module: unesc(cells[4] ?? ""), scope: unesc(cells[5] ?? ""), marker: unesc(cells[6] ?? "") };
+}
+
+/** Definition rows in index order (header skipped). Return false from the callback to stop early. */
+function forEachDefRow(index: IndexState, onRow: (row: DefRow) => boolean | void): void {
+	let first = true;
+	forEachTsvLine(index.meta.defsPath, (cells) => {
+		if (first) {
+			first = false;
+			return;
+		}
+		const row = defRowFromCells(cells);
+		if (row) return onRow(row);
+	});
 }
 
 function readFileRows(index: IndexState): { file: string; module: string; kind: string; symbols: number }[] {
@@ -457,11 +729,11 @@ export function lookupSymbol(index: IndexState, query: string, options: { limit?
 	// Pass 5: substring, opt-in. A linear pass over the TSV (~0.3 s for the 69 MB engine index) that
 	// is only reached when every indexed pass missed, so the cost is paid by misses, not by hits.
 	if (!out.length && options.substring) {
-		for (const row of readDefRows(index)) {
-			if (!probe(row.symbol).includes(needle)) continue;
+		forEachDefRow(index, (row) => {
+			if (!probe(row.symbol).includes(needle)) return;
 			accept(row, 3);
-			if (out.length >= limit) break;
-		}
+			return out.length < limit;
+		});
 	}
 	return out.sort((a, b) => a.rank - b.rank || a.scope.localeCompare(b.scope) || a.symbol.localeCompare(b.symbol)).slice(0, limit);
 }
@@ -486,10 +758,10 @@ export function symbolsInFile(index: IndexState, file: string, limit: number): D
 	const target = probe(file);
 	const path = defPath(index);
 	const out: DefRow[] = [];
-	for (const row of readDefRows(index)) {
+	forEachDefRow(index, (row) => {
 		if (probe(row.file) === target) out.push(row);
-		if (out.length >= limit) break;
-	}
+		return out.length < limit;
+	});
 	return out;
 }
 
@@ -509,7 +781,9 @@ export interface ModuleInfo {
 export function listModules(index: IndexState, options: { limit?: number } = {}): ModuleInfo[] {
 	const rows = readFileRows(index);
 	const scopes = new Map<string, string>();
-	for (const row of readDefRows(index)) if (!scopes.has(row.module) && row.scope) scopes.set(row.module, row.scope);
+	forEachDefRow(index, (row) => {
+		if (!scopes.has(row.module) && row.scope) scopes.set(row.module, row.scope);
+	});
 	const map = new Map<string, ModuleInfo>();
 	for (const row of rows) {
 		const directory = row.file.split("/").slice(0, -1).join("/");
@@ -545,6 +819,51 @@ export function listFiles(index: IndexState, module: string, options: { kind?: s
 		.filter((row) => row.module.toLowerCase() === wanted && (!options.kind || row.kind === options.kind))
 		.sort((a, b) => (/\/public\//i.test(a.file) ? -1 : 1) - (/\/public\//i.test(b.file) ? -1 : 1) || a.file.localeCompare(b.file))
 		.slice(0, limit);
+}
+
+/**
+ * Real **file names** whose basename shares a token with `query` — the answer to "this header does not
+ * exist, what does" (§3 of the field findings). These are file names, never type names: a 0-row symbol
+ * lookup must not turn into a fuzzy type suggestion, so callers label them as files and say so.
+ *
+ * Tokenisation splits camelCase and separators: `MoverState` → `mover, state`; a candidate scores by
+ * how many of the query's tokens it contains, so `MoverTypes.h` and `MoverSimulationTypes.h` outrank
+ * `MoverEditor.h`.
+ */
+export function suggestFileNames(index: IndexState, query: string, options: { limit?: number; module?: string } = {}): { file: string; module: string; score: number; tokens: string[] }[] {
+	const tokens = nameTokens(baseName(query).replace(/\.(h|hpp|hxx|inl|cpp|cc|c|md)$/i, ""));
+	if (!tokens.length) return [];
+	const limit = options.limit ?? 8;
+	const module = options.module?.toLowerCase();
+	const out: { file: string; module: string; score: number; tokens: string[] }[] = [];
+	for (const row of readFileRows(index)) {
+		if (module && row.module.toLowerCase() !== module) continue;
+		const stem = baseName(row.file).replace(/\.(h|hpp|hxx|inl|cpp|cc|c)$/i, "");
+		const mine = nameTokens(stem);
+		let score = 0;
+		for (const token of tokens) if (mine.includes(token)) score++;
+		if (!score) continue;
+		/* Two tie-breakers that matter when a name is invented: a row containing *every* query token is
+		 * closer than one sharing a single generic token, and the public header of a module is the file
+		 * an engineer is meant to include (a Private/Logging.h is not the answer to a question about a
+		 * component). */
+		if (score === tokens.length) score += 2;
+		if (fileKindLabel(row.file) === "public-header") score += 1;
+		out.push({ file: row.file, module: row.module, score, tokens: mine });
+	}
+	out.sort((a, b) => b.score - a.score || baseName(a.file).length - baseName(b.file).length || a.file.localeCompare(b.file));
+	return out.slice(0, limit);
+}
+
+/** `BlendStackAnimInstance` → `blend, stack, anim, instance` (the vocabulary suggestions are scored with). */
+export function nameTokens(value: string): string[] {
+	return (
+		value
+			.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+			.split(/[^A-Za-z0-9]+/)
+			.map((token) => token.toLowerCase())
+			.filter((token) => token.length > 1) as string[]
+	);
 }
 
 /* ──────────────────────────────────────────────────────────────────────── compile unit */
@@ -768,6 +1087,226 @@ export function pickIndex(filter: { key?: string; mode?: "definitions" | "full";
 	return { index: pool[0], candidates: pool, notes };
 }
 
+/* ────────────────────────────────────────────────────────── header (path-only) index */
+
+/**
+ * A second, much cheaper index: **file paths only**, never file contents.
+ *
+ * It exists because the highest-value question in a UE session is "does this header/type exist in
+ * *this engine version*?", and a definitions index cannot answer a no — absence from a partially
+ * scanned root set is not absence from the engine. Walking the tree and recording paths is a few
+ * seconds (measured: 52,568 plugin sources + 18,681 Runtime files in ~1 s of walking, no reads), so
+ * "exists / does not exist, here is the exact path" becomes an answer the tools can actually give.
+ *
+ * Built only by an explicit `unreal_index action: "headers"` — never implicitly by a lookup, and
+ * never as a side effect of a symbol query.
+ */
+export const HEADER_VERSION = 1;
+
+/** Header extensions the path index records (the things an `#include` line can name). */
+const HEADER_SCAN_EXT = [".h", ".hpp", ".hxx", ".inl"];
+
+export interface HeaderIndexMeta {
+	version: number;
+	key: string;
+	generatedAt: string;
+	roots: string[];
+	engineRoot?: string;
+	projectRoot?: string;
+	areas?: string[];
+	files: number;
+	/** Root provenance by kind, same vocabulary as `IndexMeta.rootKinds`. */
+	rootKinds?: Record<string, number>;
+	path: string;
+	sizeBytes: number;
+	warnings: string[];
+}
+
+export interface HeaderIndex {
+	key: string;
+	dir: string;
+	meta: HeaderIndexMeta;
+	ageMs: number;
+	healthy: boolean;
+	issues: string[];
+}
+
+export function headersRoot(): string {
+	return normalizePath(joinPath(cacheDir(), "headers"));
+}
+
+/** Path-only index key: the root set (engine identity is part of the roots, so it is implied). */
+export function headerKeyFor(input: { roots: string[]; label?: string }): string {
+	const roots = input.roots.map((root) => normalizePath(root).toLowerCase()).sort();
+	const fingerprint = shortHash(["headers", ...roots].join("|"));
+	const label = (input.label ?? roots[0] ?? "index").split("/").filter(Boolean).pop() ?? "index";
+	return `hdr-${label.replace(/[^a-z0-9]/gi, "")}-${fingerprint}`;
+}
+
+export async function buildHeaderIndex(input: {
+	key?: string;
+	roots: ScanRoot[];
+	engineRoot?: string;
+	projectRoot?: string;
+	areas?: string[];
+	concurrency?: number;
+}): Promise<{ key: string; dir: string; files: number; durationMs: number; meta: HeaderIndexMeta; built: boolean }> {
+	const started = Date.now();
+	const dirs = input.roots.map((root) => normalizePath(root.dir));
+	const key = input.key ?? headerKeyFor({ roots: dirs });
+	const dir = normalizePath(joinPath(headersRoot(), key));
+	mkdirSync(dir, { recursive: true });
+	const warnings: string[] = [];
+
+	const discovered = await collectSourceFiles(input.roots, { concurrency: input.concurrency });
+	const rootKinds: Record<string, number> = {};
+	for (const entry of summarizeRootKinds(dirs, { projectRoot: input.projectRoot, engineRoot: input.engineRoot })) {
+		rootKinds[entry.kind] = entry.count;
+	}
+
+	const seen = new Set<string>();
+	const rows: string[] = [];
+	for (const entry of discovered) {
+		const lower = entry.abs.toLowerCase();
+		if (!HEADER_SCAN_EXT.some((ext) => lower.endsWith(ext))) continue;
+		if (seen.has(lower)) continue;
+		seen.add(lower);
+		const module = entry.root.module ?? moduleFromBuildCs(entry.abs);
+		rows.push(`${esc(entry.abs)}\t${esc(module)}\t${fileKindLabel(entry.abs)}`);
+	}
+	rows.sort((a, b) => a.localeCompare(b));
+
+	const tsv = `file\tmodule\tkind\n${rows.join("\n")}\n`;
+	const path = normalizePath(joinPath(dir, "headers.tsv"));
+	writeTextAtomic(path, tsv);
+
+	const meta: HeaderIndexMeta = {
+		version: HEADER_VERSION,
+		key,
+		generatedAt: new Date().toISOString(),
+		roots: dirs,
+		engineRoot: input.engineRoot ? normalizePath(input.engineRoot) : undefined,
+		projectRoot: input.projectRoot ? normalizePath(input.projectRoot) : undefined,
+		areas: input.areas,
+		files: rows.length,
+		rootKinds,
+		path,
+		sizeBytes: Buffer.byteLength(tsv, "utf8"),
+		warnings,
+	};
+	writeJsonAtomic(joinPath(dir, "meta.json"), meta);
+	return { key, dir, files: rows.length, durationMs: Date.now() - started, meta, built: true };
+}
+
+export function listHeaderIndexes(): HeaderIndex[] {
+	const root = headersRoot();
+	if (!existsSync(root)) return [];
+	const out: HeaderIndex[] = [];
+	for (const key of readdirSync(root)) {
+		const meta = readJson<HeaderIndexMeta>(joinPath(root, key, "meta.json"));
+		if (!meta || !meta.path) continue;
+		const issues: string[] = [];
+		if (meta.version !== HEADER_VERSION) issues.push(`format v${meta.version}, current v${HEADER_VERSION}`);
+		if (!existsSync(meta.path)) issues.push("headers.tsv missing");
+		for (const r of meta.roots ?? []) if (!existsSync(r)) issues.push(`root no longer present: ${r}`);
+		let ageMs = 0;
+		try {
+			ageMs = Date.now() - statSync(joinPath(root, key)).mtimeMs;
+		} catch {
+			/* unreadable directory: report age 0 */
+		}
+		out.push({ key, dir: normalizePath(joinPath(root, key)), meta, ageMs, healthy: issues.length === 0, issues });
+	}
+	return out.sort((a, b) => b.ageMs - a.ageMs);
+}
+
+export function loadHeaderIndex(key: string): HeaderIndex | undefined {
+	const dir = normalizePath(joinPath(headersRoot(), key));
+	const meta = readJson<HeaderIndexMeta>(joinPath(dir, "meta.json"));
+	if (!meta) return undefined;
+	let ageMs = 0;
+	try {
+		ageMs = Date.now() - statSync(dir).mtimeMs;
+	} catch {
+		/* caller reports the missing directory */
+	}
+	return { key, dir, meta, ageMs, healthy: meta.version === HEADER_VERSION && existsSync(meta.path), issues: meta.version === HEADER_VERSION ? [] : [`format v${meta.version}, current v${HEADER_VERSION}`] };
+}
+
+/** The newest healthy path index over exactly these roots. Never builds anything. */
+export function pickHeaderIndex(roots: string[]): HeaderIndex | undefined {
+	const want = rootsSignature(roots);
+	return listHeaderIndexes().find((state) => state.healthy && rootsSignature(state.meta.roots ?? []) === want);
+}
+
+export interface HeaderRow {
+	file: string;
+	module: string;
+	kind: string;
+	/** `exact` = that file name exists; `suffix` = a path suffix match; `token` = shares name tokens. */
+	match: "exact" | "suffix" | "token";
+}
+
+function readHeaderRows(index: HeaderIndex): { file: string; module: string; kind: string }[] {
+	const text = readFileSync(index.meta.path, "utf8");
+	return readTsv(text) as unknown as { file: string; module: string; kind: string }[];
+}
+
+/**
+ * "Does this header exist?" — exact file-name match first, then path suffix, then name-token overlap.
+ * Token hits are labelled `token`: they are *related files*, not the file asked for, and callers must
+ * present them that way (an invented name must not be quietly reinterpreted as a real one).
+ */
+export function lookupHeaderPaths(index: HeaderIndex, name: string, options: { limit?: number } = {}): HeaderRow[] {
+	const raw = normalizePath(name).trim();
+	const leafRaw = baseName(raw).replace(/\.(h|hpp|hxx|inl)$/i, "");
+	const leaf = baseName(raw).toLowerCase();
+	const stem = leaf.replace(/\.(h|hpp|hxx|inl)$/i, "");
+	/* Tokenise the cased name: `PoseSearchResultTypes` → pose, search, result, types. A lowered stem
+	 * would tokenise as one long token and match nothing. */
+	const queryTokens = nameTokens(leafRaw);
+	const limit = options.limit ?? 12;
+	const out: HeaderRow[] = [];
+	for (const row of readHeaderRows(index)) {
+		const rowLeaf = baseName(row.file).toLowerCase();
+		const rowLower = row.file.toLowerCase();
+		let match: HeaderRow["match"] | undefined;
+		if (rowLeaf === leaf || rowLeaf === `${stem}.h`) match = "exact";
+		else if (raw.includes("/") && rowLower.endsWith(leaf)) match = "suffix";
+		else if (queryTokens.length > 1) {
+			const rowTokens = nameTokens(rowLeaf.replace(/\.(h|hpp|hxx|inl)$/i, ""));
+			let hits = 0;
+			for (const token of queryTokens) if (rowTokens.includes(token)) hits++;
+			if (hits === queryTokens.length) match = "token";
+		}
+		if (!match) continue;
+		out.push({ file: row.file, module: row.module, kind: row.kind, match });
+	}
+	const order = { exact: 0, suffix: 1, token: 2 } as const;
+	out.sort((a, b) => order[a.match] - order[b.match] || a.file.localeCompare(b.file));
+	return out.slice(0, limit);
+}
+
+/** Real header names related to `name` (for the "this header does not exist, here is what does" answer). */
+export function suggestHeaderPaths(index: HeaderIndex, name: string, options: { limit?: number } = {}): HeaderRow[] {
+	const stem = baseName(name).replace(/\.(h|hpp|hxx|inl)$/i, "");
+	const queryTokens = nameTokens(stem);
+	if (!queryTokens.length) return [];
+	const limit = options.limit ?? 8;
+	const out: { row: HeaderRow; score: number }[] = [];
+	for (const row of readHeaderRows(index)) {
+		const rowTokens = nameTokens(baseName(row.file).replace(/\.(h|hpp|hxx|inl)$/i, ""));
+		let score = 0;
+		for (const token of queryTokens) if (rowTokens.includes(token)) score++;
+		if (!score) continue;
+		if (score === queryTokens.length) score += 2;
+		if (row.kind === "public-header") score += 1;
+		out.push({ row: { ...row, match: "token" }, score });
+	}
+	out.sort((a, b) => b.score - a.score || baseName(a.row.file).length - baseName(b.row.file).length || a.row.file.localeCompare(b.row.file));
+	return out.slice(0, limit).map((entry) => entry.row);
+}
+
 /* ──────────────────────────────────────────────────────────────────────── helpers */
 
 const fileKindLabel = (file: string) => (/\/public\//i.test(file) ? "public-header" : /\.(cpp|cc|c|mm|cpp20)$/i.test(file) ? "source" : /\/internal\//i.test(file) ? "internal-header" : "header");
@@ -804,17 +1343,56 @@ function writeJsonAtomic(path: string, value: unknown): void {
 	writeTextAtomic(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-/** Module attribution without Query data: the nearest `*.Build.cs` above the file. */
-export function moduleFromBuildCs(file: string): string {
+/**
+ * Module attribution without Query data: the nearest `*.Build.cs` above the file.
+ *
+ * The **module file name is the module name** — UBT names a module after its `X.Build.cs`, not after
+ * the directory. `Engine/Plugins/Animation/PoseSearch/Source/Runtime/PoseSearch.Build.cs` is module
+ * `PoseSearch` in a directory leaf-named `Runtime`, and `Runtime` is a leaf reused by 10 other modules
+ * in the 5.8 tree (`Source` 20x, `Runtime` 10x, `Editor` 9x, `Module` 5x out of 1,079). Naming the
+ * leaf is what made `unreal_symbol module: "PoseSearch"` return 0 rows in a definitions index while
+ * `unreal_context module: "PoseSearch"` (UBT data) returned the truth.
+ *
+ * `moduleNames` (from a `.uplugin`'s Modules[].Name) breaks ties when one directory owns several
+ * `*.Build.cs` files: prefer the declared name, then the leaf, then the shortest.
+ */
+export function moduleFromBuildCs(file: string, moduleNames?: string[]): string {
 	const parts = normalizePath(file).split("/");
 	for (let i = parts.length - 2; i >= 0; i--) {
-		const name = parts[i];
-		if (name && existsSync(`${parts.slice(0, i + 1).join("/")}/${name}.Build.cs`)) return name;
+		const dir = parts.slice(0, i + 1).join("/");
+		const leaf = parts[i] ?? "";
+		const names = buildCsNames(dir);
+		if (!names.length) continue;
+		return pickModuleName(names, leaf, moduleNames);
 	}
 	const marker = parts.indexOf("Source");
 	const candidate = marker >= 0 ? parts[marker + 1] : undefined;
 	if (candidate) return candidate;
 	return parts[parts.length - 2] ?? "root";
+}
+
+/** Module names owned by `dir`: basenames of its `*.Build.cs` files (empty when it owns none). */
+export function buildCsNames(dir: string): string[] {
+	const here = normalizePath(dir);
+	let names: string[];
+	try {
+		names = readdirSync(here);
+	} catch {
+		return [];
+	}
+	return names.filter((entry) => entry.endsWith(".Build.cs")).map((entry) => entry.slice(0, -".Build.cs".length));
+}
+
+/** Choose the module name a directory's `*.Build.cs` files imply (see `moduleFromBuildCs`). */
+export function pickModuleName(names: string[], leaf: string, moduleNames?: string[]): string {
+	if (names.length === 0) return leaf;
+	if (names.length === 1) return names[0]!;
+	if (moduleNames?.length) {
+		const declared = names.filter((name) => moduleNames.includes(name)).sort((a, b) => a.length - b.length);
+		if (declared.length) return declared[0]!;
+	}
+	if (names.includes(leaf)) return leaf;
+	return [...names].sort((a, b) => a.length - b.length || a.localeCompare(b))[0]!;
 }
 
 /**
@@ -831,8 +1409,16 @@ export interface RootOptions {
 	/** Plugin directories (absolute), e.g. from `PluginSummary.dir`. */
 	pluginDirs?: string[];
 	includeEngine?: boolean;
-	/** Sub-directories of `Engine/Source` to scan. Default `DEFAULT_ENGINE_AREAS` (`["Runtime"]`). */
+	/**
+	 * What to scan on the engine side. Two shapes, both rooted at the engine install:
+	 * - an `Engine/Source` area: `"Runtime"`, `"Editor"`, `"Runtime/Core"`, `"Runtime/CoreUObject"`;
+	 * - an engine-plugin area, prefixed `Plugins`: `"Plugins"` (every plugin under `Engine/Plugins`,
+	 *   ~2.8x the Runtime scan) or a subtree `"Plugins/Animation/PhysicsControl"`.
+	 * Default `DEFAULT_ENGINE_AREAS` (`["Runtime"]`).
+	 */
 	engineAreas?: string[];
+	/** Declared module names per plugin root dir (from its `.uplugin`), used to name modules correctly. */
+	pluginModuleNames?: Record<string, string[]>;
 	fs?: FsAdapter;
 }
 
@@ -848,11 +1434,12 @@ const SKIP_DIR_NAMES = new Set(["Intermediate", "Binaries", "Saved", ".git", ".v
  * modules at `Runtime/Core`, `Runtime/Engine/Classes`... and areas are addressable as
  * `engineAreas: ["Runtime/Core"]`, so the search must recurse (depth-capped, build-system dirs skipped).
  */
-function moduleDirsUnder(dir: string, scope: ScanRoot["scope"], fs: FsAdapter, maxDepth = 3, depth = 0): ScanRoot[] {
+function moduleDirsUnder(dir: string, scope: ScanRoot["scope"], fs: FsAdapter, maxDepth = 3, depth = 0, moduleNames?: string[]): ScanRoot[] {
 	const roots: ScanRoot[] = [];
 	const here = normalizePath(dir);
-	if (fs.listDir(here).some((entry) => entry.endsWith(".Build.cs"))) {
-		roots.push({ dir: here, scope, module: baseName(here) });
+	const names = buildCsNames(here);
+	if (names.length) {
+		roots.push({ dir: here, scope, module: pickModuleName(names, baseName(here), moduleNames) });
 		return roots; // a module's own tree never contains another module
 	}
 	if (depth >= maxDepth) return roots;
@@ -860,7 +1447,7 @@ function moduleDirsUnder(dir: string, scope: ScanRoot["scope"], fs: FsAdapter, m
 		const abs = joinPath(here, child);
 		if (!fs.isDirectory(abs)) continue;
 		if (SKIP_DIR_NAMES.has(child)) continue;
-		roots.push(...moduleDirsUnder(abs, scope, fs, maxDepth, depth + 1));
+		roots.push(...moduleDirsUnder(abs, scope, fs, maxDepth, depth + 1, moduleNames));
 	}
 	return roots;
 }
@@ -879,7 +1466,8 @@ export function assembleRoots(options: RootOptions): { roots: ScanRoot[]; notes:
 
 	for (const pluginDir of options.pluginDirs ?? []) {
 		const abs = normalizePath(pluginDir);
-		const found = moduleDirsUnder(joinPath(abs, "Source"), "Plugin", fs);
+		const moduleNames = options.pluginModuleNames?.[abs];
+		const found = moduleDirsUnder(joinPath(abs, "Source"), "Plugin", fs, 3, 0, moduleNames);
 		roots.push(...found);
 		if (!found.length) notes.push(`plugin ${baseName(abs)}: no C++ module roots`);
 	}
@@ -888,7 +1476,9 @@ export function assembleRoots(options: RootOptions): { roots: ScanRoot[]; notes:
 		const engineRoot = normalizePath(options.engineRoot);
 		const areas = options.engineAreas?.length ? options.engineAreas : DEFAULT_ENGINE_AREAS;
 		for (const area of areas) {
-			const found = moduleDirsUnder(joinPath(engineRoot, "Engine/Source", area), "Engine", fs, 4);
+			// "Plugins/..." addresses Engine/Plugins; anything else is an Engine/Source area.
+			const pluginArea = /^plugins(\/|$)/i.test(area);
+			const found = moduleDirsUnder(joinPath(engineRoot, pluginArea ? "Engine" : "Engine/Source", area), "Engine", fs, pluginArea ? 6 : 4);
 			roots.push(...found);
 			notes.push(`engine ${area}: ${found.length} module root(s)`);
 		}
