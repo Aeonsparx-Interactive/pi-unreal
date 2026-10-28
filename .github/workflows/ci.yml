@@ -37,6 +37,41 @@ jobs:
       - name: Test
         run: bun test
 
+  release-hygiene:
+    name: changelog gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Repo rule: every version bump adds a CHANGELOG.md entry. Release notes stay
+      # auto-generated from commits, so the changelog is the only authored release record.
+      - name: CHANGELOG.md exists
+        run: test -f CHANGELOG.md || { echo "::error::CHANGELOG.md is missing"; exit 1; }
+
+      - name: A changed version needs a changelog entry
+        run: |
+          set -e
+          BASE=${{ github.base_ref }}
+          [ -n "$BASE" ] || BASE=main
+          git fetch --no-tags origin "$BASE" >/dev/null 2>&1 || true
+          VERSION=$(node -p "require('./package.json').version")
+          if git diff --name-only "origin/$BASE"...HEAD 2>/dev/null | grep -qx package.json; then
+            OLD=$(git show "origin/$BASE:package.json" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).version))")
+            if [ "$OLD" != "$VERSION" ]; then
+              grep -q "^## \[$VERSION\]" CHANGELOG.md || {
+                echo "::error::package.json version $VERSION has no '## [$VERSION]' heading in CHANGELOG.md"
+                exit 1
+              }
+              echo "changelog entry found for v$VERSION"
+            else
+              echo "package.json touched without a version change"
+            fi
+          else
+            echo "package.json unchanged (v$VERSION)"
+          fi
+
   typecheck:
     name: typecheck (advisory)
     runs-on: ubuntu-latest
