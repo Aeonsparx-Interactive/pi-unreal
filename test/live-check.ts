@@ -9,7 +9,11 @@ import { buildPluginIndex, computeScanDirs, resolveProjectPlugins } from "../ext
 import { createWindowsRegistryReader } from "../extensions/unreal/lib/registry.ts";
 import { realFs } from "../extensions/unreal/lib/util.ts";
 
-const BENCH = process.argv[2] ?? "C:/Users/Luqman/Documents/lost-project/Lp.uproject";
+const BENCH = process.argv[2];
+if (!BENCH) {
+	console.error("usage: bun test/live-check.ts <path/to.project.uproject> (no baked default: a machine path resolves to nothing on CI)");
+	process.exit(1);
+}
 const registry = createWindowsRegistryReader({ timeoutMs: 10000 });
 
 const t0 = Date.now();

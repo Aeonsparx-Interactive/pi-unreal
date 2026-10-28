@@ -7,7 +7,7 @@ import { createWindowsRegistryReader } from "../extensions/unreal/lib/registry.t
 import { computeCacheKey, loadCachedIndex, saveCachedIndex } from "../extensions/unreal/lib/cache.ts";
 import { realFs } from "../extensions/unreal/lib/util.ts";
 
-const project = process.argv[2] ?? "C:/Users/Luqman/Documents/lost-project/Lp.uproject";
+const project = process.argv[2];
 const registry = createWindowsRegistryReader({ timeoutMs: 15000 });
 
 const t0 = Date.now();

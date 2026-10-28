@@ -254,8 +254,10 @@ it("filterEntries keeps prefix matches, ubtCompileDbPaths lists both layout spot
 	expect(paths).toContain("C:/E/Engine/Intermediate/Build/Win64/UnrealBuildTool/compile_commands.json");
 });
 
-it("compileDbScope: project + plugins, engine area added only for the engine scope", () => {
+it("compileDbScope: project + plugins, engine Source AND Plugins for the engine scope", () => {
 	expect(compileDbScope({ projectDir: "C:/Proj", pluginDirs: ["C:/P1", "C:/P2"], engineRoot: "C:/E", scope: "project" })).toEqual(["C:/Proj", "C:/P1", "C:/P2"]);
-	expect(compileDbScope({ projectDir: "C:/Proj", engineRoot: "C:/E", scope: "project+engine" })).toEqual(["C:/Proj", "C:/E/Engine/Source"]);
+	// Engine/Plugins is part of the engine scope: an installed engine ships most gameplay types as
+	// plugins, and a database without them silently drops every plugin .cpp body from clangd.
+	expect(compileDbScope({ projectDir: "C:/Proj", engineRoot: "C:/E", scope: "project+engine" })).toEqual(["C:/Proj", "C:/E/Engine/Source", "C:/E/Engine/Plugins"]);
 	expect(compileDbScope({ scope: "project" })).toEqual([]);
 });
