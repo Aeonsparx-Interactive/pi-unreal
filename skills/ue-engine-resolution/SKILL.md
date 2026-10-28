@@ -67,23 +67,56 @@ shadowing earlier ones on name collision. Use the reported status (`resolved`, `
 `disabled`, `version-warning`, `shadowed`, `no-modules`) instead of assuming a plugin is
 available. `Binaries/`, `Intermediate/`, `Saved/`, and `ThirdParty/` are never scanned.
 
+Two facts are separate and both matter, and the report keeps them apart:
+
+- **Reference status**: `Mover: resolved ← Engine · modules Mover(Runtime), MoverCVDData(Runtime),
+  MoverEditor(UncookedOnly)`. The modules are what the reference buys; "resolved" alone never said
+  which C++ exists.
+- **Availability without a reference**: engine plugins with `EnabledByDefault: true` load even when
+  the `.uproject` does not list them, and a module can be inside the target's link graph without the
+  plugin being referenced. `unreal_context` with `module: "PhysicsControl"` reports the graph check,
+  the module directory, the declared `Type`, and the `.uproject` status as separate lines — "the
+  project lacks plugin X" is not "module X is unavailable", and not "X does not exist".
+
 ## After resolution: where declarations and build context come from
 
 `unreal_resolve_engine` answers *which engine*. The rest of the navigation questions are answered
 by the index tools, and they use the resolved root — a wrong engine root means a wrong index:
 
 - `unreal_symbol` — declaration site + owning module for a type, function, `UPROPERTY`, delegate.
-  Engine scope is opt-in (`scope: "engine"`) and its areas come from
-  `PublicDependencyModuleNames` in the modules under `Engine/Source/<area>`, so the scan follows
-  what the project actually depends on.
+  Engine scope is opt-in (`scope: "engine"`). Its roots are `Engine/Source/<area>` **plus the plugin
+  roots the `.uproject` enables** — in an installed engine most gameplay types ship as plugins
+  (`Mover`, `PoseSearch`, `SmartObjects`, `BlendStack`, `StateTree`, `GameplayAbilities`), so an
+  index of `Engine/Source/Runtime` alone reports 0 rows for `UMoverComponent`. Plugins the project
+  does not reference are opt-in too: `engineAreas: ["Plugins"]` (every `Engine/Plugins` source,
+  ~2.8× the `Runtime` scan) or `engineAreas: ["Plugins/Animation/PhysicsControl"]` (one plugin).
+- **A 0-row answer is about the roots scanned, not about the engine.** It prints the index keys, the
+  root kinds (`279 engine-source root(s), 62 engine-plugin root(s)`) and the next call. Run
+  `unreal_index` with `action: "status"` before trusting a 0: an index key encodes its root set, so
+  an index you did not build is not what was searched.
+- `unreal_index` with `action: "headers"` — "does this header exist in this engine version?" A
+  path-only index (no content read, seconds, ~38 000 header paths on a UE 5.8 install): exact path,
+  owning module, owning plugin, `EnabledByDefault`, `.uproject` reference. Invented names return
+  *not a file path* plus the closest real **file** names — a file name is not a type, and a token
+  match is not proof of existence. Never built implicitly.
 - `unreal_context` — include paths, C++ standard, compiler, the real `WITH_*` defines read from
-  `Definitions.<Module>.h`, and the module's public/private dependency lists.
+  `Definitions.<Module>.h`, and the module's public/private dependency lists. Scope is derived from
+  path shape, so `Engine/Plugins/.../Public/X.h` is searched as engine scope, and a miss answers the
+  path question separately from the symbol question.
 - `unreal_index` — build/refresh/patch/status, `moduleRefs` for the dependency graph, and the
   UnrealBuildTool `-Mode=Query` cache underneath.
 
 No compiler, no IDE database, nothing written inside the project: the index lives in
 `~/.pi/agent/unreal-cache` (`$PI_UNREAL_CACHE_DIR`). clangd stays the authority for references,
-overrides, and diagnostics — see `ue-symbol-navigation` in a UE project's `.agents/skills/`.
+overrides, and diagnostics — see `ue-symbol-navigation` in a UE project's `.agents/skills/`. An
+empty clangd answer is **evidence**: on an installed engine the compile database has no engine
+translation units, so "clangd found nothing in engine code" describes the setup, not a defect to
+route around.
+
+The boundary this package does not cross: it answers C++ **declaration, module, include-path and
+dependency** facts. Asset questions — UENUM index order, UStruct field types, UCLASS/CDO instance
+values, component lists, parent chains, Blueprint graphs — need the `unreal-engine` editor MCP with
+the editor running. A C++ scan cannot see them; ask a scan only what a scan can answer.
 
 ## Conventions this package enforces
 

@@ -10,6 +10,32 @@ the owning module. No compiler, no Visual Studio, no Rider, no clangd required.
 It is **read-only**: it never writes to your project, never touches the Windows registry, never
 launches the editor, and blocks three kinds of edit that damage Unreal work.
 
+## Usage
+
+### Requirements
+
+- **Windows**, with **PowerShell 7** (`pwsh`) for registry-based engine discovery. Without it the
+  extension still works: resolution falls back to `UNREAL_ENGINE` / `UE_ROOT` /
+  `PI_UNREAL_ENGINE_ROOT`, the Launcher's install list, and a scan of
+  `C:/Program Files/Epic Games`.
+- An Unreal Engine installation the project can resolve to (Launcher install or source build).
+  Descriptor field handling is transcribed from UE 5.8.
+- Nothing else. No compiler, no IDE language service. clangd is optional enrichment for
+  `compiledb` and the `clangd --check` acceptance step.
+
+
+### Installation
+
+```bash
+pi install npm:@aeonsparx/pi-unreal                              # optionally pin to a specific version, reproducible
+pi install git:github.com/Aeonsparx-Interactive/pi-unreal@v1.1   # follows patch releases on the v1.1 line
+```
+
+The `npm:` route installs from the registry and pins an exact version. The `git:` route clones the
+repository and checks out the ref: a line alias (`@v1.1`) is a moving tag that patch releases
+force-move, so `pi` picks up patches on update; pin `@v1.1.0` for a fixed snapshot. Loading straight
+from a clone still works and needs no install: `pi -e ./extensions/unreal/index.ts`.
+
 ## What you get in a session
 
 **Context is detected for you.** When the session starts in a directory that contains a
@@ -29,8 +55,8 @@ project?", "Where is `FLpMovementDirectionThresholds` defined?", "What do I need
 | `unreal_plugin_inspect` | One `.uplugin` as the engine parses it: modules, loading phases, version fields, plugin dependencies |
 | `unreal_symbol` | "Where is this class / struct / function / `UPROPERTY` / delegate declared?" One line per hit: kind, file:line, module |
 | `unreal_symbol_list` | "What does this project define?" Names by prefix — `ULp`, `ANiMy`, `UAnim` |
-| `unreal_context` | "What does this file/module include, define, and depend on?" Include paths, dependency lists, the real `WITH_*` defines |
-| `unreal_index` | Builds and reports the source index, and the clangd compile database on request |
+| `unreal_context` | "What does this file/module include, define, and depend on?" Include paths, dependency lists, the real `WITH_*` defines; for a module, also whether the target's module graph contains it and how the `.uproject` treats its plugin |
+| `unreal_index` | Builds and reports the source index, the path-only **header index** ("does this header exist in this engine version?"), and the clangd compile database on request |
 
 **Slash commands you can type yourself:**
 
@@ -53,11 +79,12 @@ modules: Lp (Runtime), LpEditor (Editor)
 plugins declared: 25
 plugin index: 897 .uplugin (cache hit)
 plugin references:
-  MassGameplay: resolved ← Engine
-  ModularGameplay: resolved ← Engine
-  SomeLocalPlugin: resolved ← Project
+  Mover: resolved ← Engine · modules Mover(Runtime), MoverCVDData(Runtime), MoverEditor(UncookedOnly)
+  MassGameplay: resolved ← Engine · modules MassEntity(Runtime), MassCore(Runtime), MassSimulation(Runtime), …
+  SomeLocalPlugin: resolved ← Project · modules SomeLocalPlugin(Runtime)
   RetiredPlugin: missing
   totals: 22 resolved, 3 missing of 25 references
+  engine plugins available with NO .uproject reference (EnabledByDefault true): GameplayCameras, IKRig
 ```
 
 Example — `unreal_symbol` for an engine type (engine index already built):
@@ -69,6 +96,36 @@ unreal_symbol 'AActor' scope=engine: 1 definition(s)
 
 That is a definition line, not a grep dump: grepping a hot engine class name returns ~176 files of
 noise, which is exactly what burns a session's context.
+
+Example — `unreal_index` `action: "headers"`, the question a symbol index cannot answer:
+
+```text
+unreal_index headers → hdr-UE_5.8-1a40c1c3d516
+  37,788 header paths from 1,934 roots (1,655 engine-plugin root(s), 279 engine-source root(s))
+  'MoverState.h': does NOT exist as a file path in this engine version
+  closest real file names (files, not types):
+    Engine/Plugins/Experimental/Mover/Source/Mover/Public/MoverTypes.h   [Mover]
+    Engine/Plugins/Experimental/Mover/Source/Mover/Public/MoverSimulationTypes.h   [Mover]
+    Engine/Plugins/Experimental/Mover/Source/Mover/Public/MovementMode.h   [Mover]
+    Engine/Plugins/Experimental/Mover/Source/Mover/Public/MovementModeStateMachine.h   [Mover]
+```
+
+`MoverState.h` is the kind of name an agent invents. The answer says it is not a file, lists real
+files, and never presents a file name as a type. The same call on
+`PhysicsControlComponent.h` returns the path plus `plugin PhysicsControl [Engine] · EnabledByDefault
+false · .uproject reference NO` — the file exists, the project does not reference the plugin, and
+those are different facts.
+
+Example — the coverage lines a 0-row answer prints (nothing here says "the engine has no such type"):
+
+```text
+unreal_symbol 'PhysicsControlComponent' scope=engine: 0 definition(s)
+  · no definitions matched 'PhysicsControlComponent' in scope 'engine'
+  · scanned engine index idx-engine-defs-b8d82464af4a: 279 engine-source root(s), 62 engine-plugin root(s)
+  · engine plugins on disk: 897, referenced by this .uproject: 25; the engine index scans referenced plugins only
+  · a plugin the project does not reference is not in any index root: pass engineAreas ["Plugins"] (…2.8× the Runtime scan) or ["Plugins/Animation/PhysicsControl"]
+  · next: unreal_symbol query 'PhysicsControlComponent' scope "all" prefix true, or unreal_index action "headers" name "PhysicsControlComponent.h"
+```
 
 ## Guardrails (automatic, nothing to enable)
 
@@ -94,8 +151,18 @@ Because of that model:
 - Symbol lookups never stall. If a question needs engine sources and no engine index exists, the
   agent reports the cost and how to pay it, and asks you. Say **yes** once per machine —
   `/unreal-cache stats` shows what you have. Engine scans default to `engineAreas: ["Runtime"]`,
-  which is enough for gameplay base classes (`AActor`, `UAnimInstance`, `USceneComponent`);
-  `Editor` and `Developer` are opt-in and roughly triple the scan.
+  which is the engine's **own** gameplay code (`AActor`, `UAnimInstance`, `USceneComponent`);
+  `Editor` and `Developer` are opt-in and roughly triple the scan. An engine-scope index always
+  includes the plugin roots your `.uproject` enables, so `UMoverComponent` and the PoseSearch types
+  are in it. Types shipped by plugins you do **not** reference (`PhysicsControl`, `BlendStack`,
+  `StateTree`, `GameplayAbilities`) need `engineAreas: ["Plugins"]` — every `Engine/Plugins`
+  source tree, ~2.8× the `Runtime` scan — or `engineAreas: ["Plugins/Animation/PhysicsControl"]`
+  for one plugin.
+- "Does this header exist in this engine version?" is a path question, not a symbol question:
+  `unreal_index` with `action: "headers"` (and `name: "MoverState.h"`) answers it in seconds from a
+  path walk, and says which plugin owns a header it finds, whether that plugin is
+  `EnabledByDefault`, and whether your `.uproject` references it. Invented names come back as
+  *not a file path* plus the closest real **file** names — never as types.
 - Ask for `unreal_index` with `action: "build"`, `scope: "engine"` when you want engine-wide
   navigation, and `action: "compiledb"` when you want clangd's references/call hierarchy.
 - After a branch switch, a rebase, adding a plugin, or an engine version change, say "rebuild the
@@ -104,17 +171,6 @@ Because of that model:
   inside your project tree or your engine installation. The compile database encodes this
   machine's absolute paths, so it is machine-local by design.
 
-## Requirements
-
-- **Windows**, with **PowerShell 7** (`pwsh`) for registry-based engine discovery. Without it the
-  extension still works: resolution falls back to `UNREAL_ENGINE` / `UE_ROOT` /
-  `PI_UNREAL_ENGINE_ROOT`, the Launcher's install list, and a scan of
-  `C:/Program Files/Epic Games`.
-- An Unreal Engine installation the project can resolve to (Launcher install or source build).
-  Descriptor field handling is transcribed from UE 5.8.
-- Nothing else. No compiler, no IDE language service. clangd is optional enrichment for
-  `compiledb` and the `clangd --check` acceptance step.
-
 ## Troubleshooting
 
 | Report | What to do |
@@ -122,82 +178,23 @@ Because of that model:
 | `engine: AMBIGUOUS — more than one valid installation matches` | Two roots match the association. Pass the one you want as `engineRootHint` (e.g. `engineRootHint: "C:/Program Files/Epic Games/UE_5.8"`). |
 | `engine: UNRESOLVED` with rejected candidates | Read the reasons — a stale registry key, a missing `Build.version`, a version mismatch. The report lists remediation steps; the extension never writes registry keys for you. |
 | `no .uproject within 4 levels above …` | The search walks up from the working directory. Pass the project explicitly: `project: "C:/Work/Lp/Lp.uproject"` (a directory containing one works too). |
-| `unreal_symbol` finds nothing in scope `engine` | Build the engine index first (`unreal_index` → `action: "build"`, `scope: "engine"`). |
+| `unreal_symbol` finds nothing in scope `engine` | Read the coverage lines the answer prints: they name the root kinds that were scanned. A plugin your `.uproject` does not reference is in no index root — `engineAreas: ["Plugins"]` (or one plugin subtree), then rebuild. |
+| `unreal_symbol` finds nothing and you are not sure the name exists | `unreal_index` → `action: "headers"`, `name: "ThatName.h"`: a seconds-long path answer with the closest real file names. |
 | Results look stale after a rebase or engine update | Re-run with `refresh: true`, or `/unreal-cache clear`. |
 | `no plugin named "X" in the index` | That reference is genuinely not on disk. `/unreal` shows which roots were scanned. |
 
-## What it deliberately does not do
+### What it deliberately does not do
 
 - It does not install, register, migrate, or "fix" an engine, and never writes registry keys.
 - It does not build, cook, package, launch the editor, or edit `.ini` files.
 - It does not hand-edit assets, and blocks attempts to.
 - Symbol lookup reports **declarations**. Type resolution, overloads, call sites, inheritance and
-  diagnostics are clangd's job when clangd is installed.
+  diagnostics are clangd's job when clangd is installed. An empty clangd answer is evidence: on an
+  installed engine the compile database has no engine translation units, so "clangd found nothing"
+  in engine code is a property of the setup, not a bug this package fixes.
+- A 0-row answer is a statement about **the roots that were scanned**, never about the engine. The
+  answer names its index keys and root kinds; `unreal_index` → `action: "status"` prints the same.
+- pi-unreal answers C++ **declaration, module, include-path and dependency** facts. It does not
+  answer asset questions — UENUM index order, UStruct field types, UCLASS/CDO instance values,
+  Blueprint graphs. Those need the `unreal-engine` editor MCP with the editor running.
 - `.ini` provenance, live-coding state, and asset metadata are out of scope for v1.
-
-## Install
-
-Published as **`@aeonsparx/pi-unreal`** on npmjs.
-
-```bash
-pi install npm:@aeonsparx/pi-unreal@1.0.0                        # pinned version, reproducible
-pi install git:github.com/Aeonsparx-Interactive/pi-unreal@v1.0   # follows patch releases on the v1.0 line
-```
-
-The `npm:` route installs from the registry and pins an exact version. The `git:` route clones the
-repository and checks out the ref: a line alias (`@v1.0`) is a moving tag that patch releases
-force-move, so `pi` picks up patches on update; pin `@v1.0.2` for a fixed snapshot. Loading straight
-from a clone still works and needs no install: `pi -e ./extensions/unreal/index.ts`.
-
-## Releasing (maintainers)
-
-| `package.json` bump | GitHub Release | npmjs |
-| --- | --- | --- |
-| `major` / `minor` | **new** release `v<major>.<minor>` | staged `<major>.<minor>.<patch>` |
-| `patch` | **updates** the existing `v<major>.<minor>` release | staged `<major>.<minor>.<patch>` |
-
-Merge a PR that bumps `version` into `main`. `.github/workflows/release.yml` runs `bun test` on
-Linux and Windows, pushes the immutable tag `v<major>.<minor>.<patch>`, moves the `v<major>.<minor>`
-alias, creates or updates that release, then stages the tarball with `npm stage publish`. **Nothing
-is public until a human approves it** (2FA, from any machine):
-
-```bash
-npm stage list @aeonsparx/pi-unreal     # stage ids (no 2FA)
-npm stage view <stage-id>              # metadata
-npm stage download <stage-id>          # inspect the exact tarball that will publish
-npm stage approve <stage-id>           # 2FA - this is the publish act
-npm stage reject <stage-id>            # 2FA - frees the staged version number
-```
-
-The same queue is on npmjs.com (Staged Packages tab). `npm stage` requires npm >= 11.15.0
-(`npm install -g npm@12`) and Node >= 22.14.0. `NPM_TOKEN` (repository secret) is a Granular Access
-Token with Read+Write and **no** 2FA bypass: CI can stage, only you can publish. Staged versions
-occupy their version number, so a rejected stage burns `x.y.z` until `npm stage reject` frees it.
-Provenance is deliberately off in v1 (`--provenance` needs a Provenance-scope token, and the
-attestation path through stage-then-approve is unverified).
-
-## Developers
-
-```bash
-bun test                      # 66 tests: resolver, descriptors, plugins, cache, gate, scanner, index, compile-db pipeline, fixture hygiene
-bun run typecheck             # tsc --noEmit
-bun test/live-check.ts "C:/path/to/Project.uproject"   # live machine smoke
-bun test/keys.census.mjs "C:/Program Files/Epic Games/UE_5.8/Engine/Plugins"
-bun run tmp/smoke.mjs project "C:/path/to/Project"     # symbol index against a real project
-bun run tmp/smoke.mjs query "C:/path/to/Project"       # UnrealBuildTool Query round trip
-bun run tmp/smoke.mjs engine "C:/path/to/Project"      # Engine/Source index (minutes, opt-in)
-bun run tmp/smoke.mjs compiledb "C:/path/to/Project"   # clangd database + `clangd --check` acceptance
-```
-
-From a clone, load the extension into a session without installing it:
-
-```bash
-pi -e ./extensions/unreal/index.ts
-```
-
-Layout: `extensions/unreal/index.ts` (tools, commands, context card, convention gate),
-`extensions/unreal/lib/` (resolver, descriptors, plugin index, symbol index, UBT Query, compile
-database), `prompts/unreal-context.md`, `skills/ue-engine-resolution/`, `test/`.
-
-Design notes and measured internals — engine resolution algorithm, descriptor fidelity, plugin
-discovery, the index and compile-database pipeline — are in [docs/internals.md](docs/internals.md).
