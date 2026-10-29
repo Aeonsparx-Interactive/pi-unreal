@@ -84,16 +84,23 @@ Two facts are separate and both matter, and the report keeps them apart:
 by the index tools, and they use the resolved root — a wrong engine root means a wrong index:
 
 - `unreal_symbol` — declaration site + owning module for a type, function, `UPROPERTY`, delegate.
-  Engine scope is opt-in (`scope: "engine"`). Its roots are `Engine/Source/<area>` **plus the plugin
-  roots the `.uproject` enables** — in an installed engine most gameplay types ship as plugins
-  (`Mover`, `PoseSearch`, `SmartObjects`, `BlendStack`, `StateTree`, `GameplayAbilities`), so an
-  index of `Engine/Source/Runtime` alone reports 0 rows for `UMoverComponent`. Plugins the project
-  does not reference are opt-in too: `engineAreas: ["Plugins"]` (every `Engine/Plugins` source,
-  ~2.8× the `Runtime` scan) or `engineAreas: ["Plugins/Animation/PhysicsControl"]` (one plugin).
+  Engine scope is opt-in (`scope: "engine"`). Its roots are engine roots only — `Engine/Source/<area>`,
+  plus the `engineAreas` dial — and its key is `(engineRoot, engineAreas)`, so a `.uproject` plugin
+  edit cannot orphan it. An engine-scope **answer** is the union with the project index, and the
+  answer prints the keys it searched (`scope 'engine' searches the union: project index <key> (…) ∪
+  engine index`) because a plugin-shipped type is in the project index: `Mover`, `PoseSearch`,
+  `SmartObjects`, `BlendStack`, `StateTree`, `GameplayAbilities` live under
+  `Engine/Plugins/<Category>/<Plugin>/Source/`, and `scope: "engine"` with no engine index used to
+  return 0 rows for `UMoverComponent` while the project index held 105 rows for
+  `MoverInputCmdContext`. Plugins the project does not reference are opt-in too:
+  `engineAreas: ["Plugins"]` (every `Engine/Plugins` source, ~2.8× the `Runtime` scan) or
+  `engineAreas: ["Plugins/Animation/PhysicsControl"]` (one plugin).
 - **A 0-row answer is about the roots scanned, not about the engine.** It prints the index keys, the
   root kinds (`279 engine-source root(s), 62 engine-plugin root(s)`) and the next call. Run
   `unreal_index` with `action: "status"` before trusting a 0: an index key encodes its root set, so
-  an index you did not build is not what was searched.
+  an index you did not build is not what was searched. `status` prints the current root set beside
+  the keys and names near misses (`near miss: index <key> … covering 1717 root(s) this call does not
+  scan`); `action: "prune"` deletes what `status` marks reclaimable (measured: 177 MB of 481 MB).
 - `unreal_index` with `action: "headers"` — "does this header exist in this engine version?" A
   path-only index (no content read, seconds, ~38 000 header paths on a UE 5.8 install): exact path,
   owning module, owning plugin, `EnabledByDefault`, `.uproject` reference. Invented names return
@@ -102,16 +109,29 @@ by the index tools, and they use the resolved root — a wrong engine root means
 - `unreal_context` — include paths, C++ standard, compiler, the real `WITH_*` defines read from
   `Definitions.<Module>.h`, and the module's public/private dependency lists. Scope is derived from
   path shape, so `Engine/Plugins/.../Public/X.h` is searched as engine scope, and a miss answers the
-  path question separately from the symbol question.
-- `unreal_index` — build/refresh/patch/status, `moduleRefs` for the dependency graph, and the
-  UnrealBuildTool `-Mode=Query` cache underneath.
+  path question separately from the symbol question. An engine-scope miss falls back to the project
+  index first (plugin headers live there), then to the header index: the answer names the header
+  index key, the owning plugin, `EnabledByDefault`, the `.uproject` reference, the module, and
+  target availability read from the **cached** Query (a miss path never runs UnrealBuildTool).
+- `unreal_index` — build/refresh/patch/status, `moduleRefs` for the dependency graph, the
+  UnrealBuildTool `-Mode=Query` cache underneath, `action: "headers"` for path existence, `action:
+  "compiledb"` (+ `check`, `installTo`) for clangd's database, `action: "clangd"` for the health
+  probe, `action: "callsites"` for a bounded text pass over one module's sources (candidates, not
+  call edges), and `action: "prune"` for reclaim.
 
 No compiler, no IDE database, nothing written inside the project: the index lives in
 `~/.pi/agent/unreal-cache` (`$PI_UNREAL_CACHE_DIR`). clangd stays the authority for references,
-overrides, and diagnostics — see `ue-symbol-navigation` in a UE project's `.agents/skills/`. An
-empty clangd answer is **evidence**: on an installed engine the compile database has no engine
-translation units, so "clangd found nothing in engine code" describes the setup, not a defect to
-route around.
+overrides, and diagnostics — see `ue-symbol-navigation` in a UE project's `.agents/skills/`. Read an
+empty clangd answer as **degraded, not absent**: on the reporting box clangd 22.1.3 answered
+declarations, references, hover, document symbols and workspace search (2,693 files indexed) while
+`get_diagnostics` published nothing — even for a file that has a compile command. Cause: the database
+clangd reads (`<project>/.vscode/unreal-clangd/compile_commands.json`) listed 6 entries, 4 of them
+deleted sources, and 5 of 7 current project translation units had no command. `unreal_index` →
+`action: "clangd"` measures that (entries vs the translation units on disk, deleted-file entries,
+per-file `compileCommand: found|none`); the repair is `action: "compiledb"` with `installTo` the
+directory clangd reads, then regeneration with the editor closed. `clangd --check` is a syntax gate,
+**not a link check** — `UnrealEngine-BuildProjectEditor` is the link check. Definitions absence is
+provable from the symbol index; a published `0` diagnostics payload is not proof of a scan.
 
 The boundary this package does not cross: it answers C++ **declaration, module, include-path and
 dependency** facts. Asset questions — UENUM index order, UStruct field types, UCLASS/CDO instance

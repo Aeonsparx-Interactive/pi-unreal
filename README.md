@@ -56,7 +56,7 @@ project?", "Where is `FLpMovementDirectionThresholds` defined?", "What do I need
 | `unreal_symbol` | "Where is this class / struct / function / `UPROPERTY` / delegate declared?" One line per hit: kind, file:line, module |
 | `unreal_symbol_list` | "What does this project define?" Names by prefix — `ULp`, `ANiMy`, `UAnim` |
 | `unreal_context` | "What does this file/module include, define, and depend on?" Include paths, dependency lists, the real `WITH_*` defines; for a module, also whether the target's module graph contains it and how the `.uproject` treats its plugin |
-| `unreal_index` | Builds and reports the source index, the path-only **header index** ("does this header exist in this engine version?"), and the clangd compile database on request |
+| `unreal_index` | Builds and reports the source index, the path-only **header index** ("does this header exist in this engine version?"), the clangd compile database, a **clangd health probe**, and cache reclaim (`status` / `prune`) |
 
 **Slash commands you can type yourself:**
 
@@ -144,7 +144,9 @@ unreal_symbol 'PhysicsControlComponent' scope=engine: 0 definition(s)
 | Engine `Runtime` index — cold | ~1 minute |
 | Engine `Runtime` index — warm | ~6 s |
 | UnrealBuildTool Query facts | ~7 s, then cached |
-| clangd compile database (`unreal_index` → `compiledb`) | minutes, ~1 GB for the engine scope |
+| clangd compile database (`unreal_index` → `compiledb`) | project scope 1.9 s (measured: the current TU set, 9 entries); minutes and ~1 GB for the engine scope |
+| Header index path walk (`unreal_index` → `headers`) | 4.5 s cold, 0.5 s warm (37,788 header paths) |
+| clangd health probe (`unreal_index` → `clangd`) | seconds, no build, no clangd process |
 
 Because of that model:
 
@@ -152,19 +154,26 @@ Because of that model:
   agent reports the cost and how to pay it, and asks you. Say **yes** once per machine —
   `/unreal-cache stats` shows what you have. Engine scans default to `engineAreas: ["Runtime"]`,
   which is the engine's **own** gameplay code (`AActor`, `UAnimInstance`, `USceneComponent`);
-  `Editor` and `Developer` are opt-in and roughly triple the scan. An engine-scope index always
-  includes the plugin roots your `.uproject` enables, so `UMoverComponent` and the PoseSearch types
-  are in it. Types shipped by plugins you do **not** reference (`PhysicsControl`, `BlendStack`,
-  `StateTree`, `GameplayAbilities`) need `engineAreas: ["Plugins"]` — every `Engine/Plugins`
-  source tree, ~2.8× the `Runtime` scan — or `engineAreas: ["Plugins/Animation/PhysicsControl"]`
-  for one plugin.
+  `Editor` and `Developer` are opt-in and roughly triple the scan. An engine-scope index covers
+  engine roots only, and an engine-scope **answer** is the union with the project index — which is
+  where the plugin types your `.uproject` enables live, so `UMoverComponent` and the PoseSearch
+  types are answered without an engine scan. Types shipped by plugins you do **not** reference
+  (`PhysicsControl`, `BlendStack`, `StateTree`, `GameplayAbilities`) need `engineAreas:
+  ["Plugins"]` — every `Engine/Plugins` source tree, ~2.8× the `Runtime` scan — or
+  `engineAreas: ["Plugins/Animation/PhysicsControl"]` for one plugin.
 - "Does this header exist in this engine version?" is a path question, not a symbol question:
   `unreal_index` with `action: "headers"` (and `name: "MoverState.h"`) answers it in seconds from a
   path walk, and says which plugin owns a header it finds, whether that plugin is
   `EnabledByDefault`, and whether your `.uproject` references it. Invented names come back as
   *not a file path* plus the closest real **file** names — never as types.
 - Ask for `unreal_index` with `action: "build"`, `scope: "engine"` when you want engine-wide
-  navigation, and `action: "compiledb"` when you want clangd's references/call hierarchy.
+  navigation, and `action: "compiledb"` when you want clangd's references/call hierarchy. That
+  action answers in three parts: `installTo: "<dir clangd reads>"` (the answer names
+  `<project>/.vscode/unreal-clangd`, because a database written where the session never reads it is
+  not an improvement), `check: "<file>"` for the `clangd --check` proof — a **syntax gate, not a link
+  check** (`UnrealEngine-BuildProjectEditor` is the link check) — and `action: "clangd"` for the
+  health probe: entries in the database clangd reads, how many translation units of its scope they
+  cover, which current sources have no compile command, and which entries name deleted files.
 - After a branch switch, a rebase, adding a plugin, or an engine version change, say "rebuild the
   Unreal index" (that is `refresh: true`).
 - Everything lives in `~/.pi/agent/unreal-cache` (override with `$PI_UNREAL_CACHE_DIR`) — never
@@ -180,20 +189,35 @@ Because of that model:
 | `no .uproject within 4 levels above …` | The search walks up from the working directory. Pass the project explicitly: `project: "C:/Work/Lp/Lp.uproject"` (a directory containing one works too). |
 | `unreal_symbol` finds nothing in scope `engine` | Read the coverage lines the answer prints: they name the root kinds that were scanned. A plugin your `.uproject` does not reference is in no index root — `engineAreas: ["Plugins"]` (or one plugin subtree), then rebuild. |
 | `unreal_symbol` finds nothing and you are not sure the name exists | `unreal_index` → `action: "headers"`, `name: "ThatName.h"`: a seconds-long path answer with the closest real file names. |
-| Results look stale after a rebase or engine update | Re-run with `refresh: true`, or `/unreal-cache clear`. |
+| Results look stale after a rebase or engine update | Re-run with `refresh: true`, or `/unreal-cache clear`. `unreal_index` → `action: "status"` prints the reclaimable bytes; `action: "prune"` returns them (177 MB of 481 MB on the reporting box). |
 | `no plugin named "X" in the index` | That reference is genuinely not on disk. `/unreal` shows which roots were scanned. |
+| `near miss: index <key> … is not what this call searched` | An index exists over a **different root set** (typically an engine scan built before 1.2, when engine keys included the project's plugin roots). The answer names it and the root delta; rebuild once with `action: "build"`, `scope: "engine"`, then `action: "prune"`. |
+| `get_diagnostics` publishes nothing | Not "no problems": the compile database clangd reads is stale. `unreal_index` → `action: "clangd"` prints the coverage (entries vs translation units on disk, deleted files, per-file `compileCommand: found\|none`). Fix: `action: "compiledb"` with `installTo` the directory clangd reads, then regenerate from the IDE with the editor closed. |
+| A header path answers `not in any symbol-index root` | Real: the answer names the header index, the module, the owning plugin, `EnabledByDefault`, the `.uproject` reference, and target availability (from the Query cache — it does not run a build to answer). Compiling from it is the paid step: `engineAreas: ["Plugins/<Category>/<Plugin>"]`. |
 
 ### What it deliberately does not do
 
 - It does not install, register, migrate, or "fix" an engine, and never writes registry keys.
 - It does not build, cook, package, launch the editor, or edit `.ini` files.
 - It does not hand-edit assets, and blocks attempts to.
-- Symbol lookup reports **declarations**. Type resolution, overloads, call sites, inheritance and
-  diagnostics are clangd's job when clangd is installed. An empty clangd answer is evidence: on an
-  installed engine the compile database has no engine translation units, so "clangd found nothing"
-  in engine code is a property of the setup, not a bug this package fixes.
+- Symbol lookup reports **declarations**. Type resolution, overloads, call hierarchy, inheritance
+  and diagnostics are clangd's job when clangd is installed — and on a real 5.8 box clangd is often
+  **degraded, not absent**: definitions, references, hover, document symbols and workspace search all
+  worked, while `get_diagnostics` published nothing for a file that has a compile command. The cause
+  is the compile database clangd reads (6 entries, 4 naming deleted files, written 2026-10-19), not
+  the engine. `unreal_index` → `action: "clangd"` measures it; the fix is regenerating that database
+  (editor closed), not switching engines. `clangd --check` is a **syntax gate, not a link check** —
+  the link check is `UnrealEngine-BuildProjectEditor`. An empty clangd answer is evidence, with this
+  reading: on an installed engine the compile database has no engine translation units, so "clangd
+  found nothing" in engine code is a property of the setup, not a bug this package fixes.
 - A 0-row answer is a statement about **the roots that were scanned**, never about the engine. The
-  answer names its index keys and root kinds; `unreal_index` → `action: "status"` prints the same.
+  answer names its index keys and root kinds; `unreal_index` → `action: "status"` prints the same,
+  plus the root set current lookups ask for. One engine fact is on the answer: a qualified 0-row
+  lookup ending `_Implementation` is the UnrealHeaderTool-generated thunk of a
+  `BlueprintNativeEvent`/`BlueprintImplementableEvent`, emitted on every implementer and **never** on
+  the declaring interface — `IMoverInputProducerInterface:ProduceInput_Implementation` legitimately
+  has no row, and the answer names the declared member (`ProduceInput`) plus the implementer rows it
+  found (`ALpMoverPawn:ProduceInput_Implementation  LpMoverPawn.cpp:353`).
 - pi-unreal answers C++ **declaration, module, include-path and dependency** facts. It does not
   answer asset questions — UENUM index order, UStruct field types, UCLASS/CDO instance values,
   Blueprint graphs. Those need the `unreal-engine` editor MCP with the editor running.

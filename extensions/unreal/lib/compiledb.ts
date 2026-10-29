@@ -26,11 +26,12 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { moduleFromSourcePath } from "./store.ts";
 import { cacheDir } from "./cache.ts";
 import { buildQueryArgs, hostPlatform, locateUbt } from "./ubt.ts";
-import { normalizePath } from "./util.ts";
+import { baseName, isAbsolutePath, normalizePath, realFs, type FsAdapter } from "./util.ts";
 
 export interface CompileEntry {
 	file: string;
@@ -488,4 +489,281 @@ export async function clangdCheck(opts: { file: string; dbDir: string; clangdPat
 	const summary = lines.filter((line) => /All checks completed|Built preamble|Indexing headers|Building AST|Loaded compilation|Invalid argument|no source file to create a PCH|^.*error:|fatal|option '/i.test(line)).slice(0, 24);
 	const ok = /All checks completed, 0 errors/.test(raw) && !/no source file to create a PCH|Loaded compilation\(s\) failed|invalid value/.test(raw);
 	return { ok, clangd, summary, notes: ok ? ["clangd compiled the file with the generated database"] : ["clangd rejected the generated database — see summary"], raw };
+}
+
+/* ---------------------------------------------------------------------------
+ * clangd health: what clangd on this machine is configured to read, and what
+ * the database it reads actually covers.
+ *
+ * `get_diagnostics` returning `published: 0` is NOT evidence that clangd looked. A definitions index
+ * makes absence provable (whole file scanned, every declaration recorded); a diagnostics publication
+ * is only evidence when a compile actually ran. The two must never be merged into one number, so this
+ * probe reports the settings and the file coverage — and never claims what clangd published.
+ * (field-findings 2026-10-28 §3: a 76-symbol publish in a prior session proves the pipeline CAN
+ * publish; the same query now publishes nothing, and the payload cannot distinguish
+ * "looked, found nothing" from "never looked".)
+ * ------------------------------------------------------------------------- */
+
+const SKIP_DB_DIRS = new Set(["intermediate", "binaries", "saved", ".git", ".vs", ".vscode", ".pi", ".idea", ".github", "thirdparty", "programs", "build", "content", "config"]);
+const TU_EXT = [".cpp", ".cc", ".cxx", ".cpp20", "inl.cpp"];
+
+/** Recursive translation-unit listing under one root (skips build output and ThirdParty). */
+export function listTranslationUnits(dir: string, maxFiles = 4000, depth = 0): string[] {
+	if (depth > 12) return [];
+	let entries: { name: string; isDirectory(): boolean }[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const out: string[] = [];
+	for (const entry of entries) {
+		if (out.length >= maxFiles) break;
+		const abs = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (SKIP_DB_DIRS.has(entry.name.toLowerCase())) continue;
+			out.push(...listTranslationUnits(abs, maxFiles - out.length, depth + 1));
+			continue;
+		}
+		const lower = entry.name.toLowerCase();
+		if (TU_EXT.some((ext) => lower.endsWith(ext)) || (lower.endsWith(".cpp") && !lower.endsWith(".d.cpp"))) out.push(normalizePath(abs));
+	}
+	return out;
+}
+
+export interface DatabaseReport {
+	path: string;
+	bytes: number;
+	ageMs: number;
+	entries: number;
+	tuCount?: number;
+	coveredTus?: number;
+	missingTus?: { file: string; module?: string }[];
+	entryFilesWithoutCommands?: string[];
+}
+
+/** One `compile_commands.json`, measured against the sources that should be in it. */
+export function describeDatabase(path: string, roots: { dir: string; module?: string }[] = []): DatabaseReport {
+	let bytes = 0;
+	let ageMs = 0;
+	try {
+		const stat = statSync(path);
+		bytes = stat.size;
+		ageMs = Date.now() - stat.mtimeMs;
+	} catch {
+		return { path, bytes: 0, ageMs: -1, entries: 0 };
+	}
+	const entries = readCompileCommands(path);
+	const known = new Set(entries.map((entry) => normalizePath(entry.file).toLowerCase()));
+	const report: DatabaseReport = { path, bytes, ageMs, entries: entries.length };
+	const tus: { file: string; module?: string }[] = [];
+	for (const root of roots) {
+		// A root rarely carries a module label (the compiledb scope is a list of directories), and the
+		// "not in it" list is useless without the module: name it from the /Source/<Module>/ path shape.
+		for (const file of listTranslationUnits(root.dir)) tus.push({ file, module: root.module ?? moduleFromSourcePath(file) });
+	}
+	report.tuCount = tus.length;
+	const missing = tus.filter((unit) => !known.has(unit.file.toLowerCase()));
+	report.coveredTus = tus.length - missing.length;
+	report.missingTus = missing.slice(0, 12);
+	report.entryFilesWithoutCommands = entries.filter((entry) => !existsSync(normalizePath(entry.file))).map((entry) => normalizePath(entry.file)).slice(0, 12);
+	return report;
+}
+
+/** `compile_commands.json` + `compileCommands*.json` files in a directory (clangd's `-bcr` siblings are ignored: they are its own index). */
+export function databasesIn(dir: string): string[] {
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+	} catch {
+		return [];
+	}
+	return names
+		.filter((name) => /^compile_commands\.json$/i.test(name) || /^compilecommands.*\.json$/i.test(name))
+		.map((name) => normalizePath(join(dir, name)));
+}
+
+export interface ClangdConfig {
+	path?: string;
+	compilationDatabase?: string;
+	raw?: string;
+	notes: string[];
+}
+
+/**
+ * The project's own clangd configuration. Read, never written: the `.clangd` file is the developer's
+ * authority (it carries the `/Yu* /Fm* /FI* /Fp*` removals and the clang-cl forcing), and the
+ * Unreal-clangd extension owns `.vscode/settings.json`.
+ */
+export function readClangdConfig(projectDir: string, fs: FsAdapter = realFs): ClangdConfig {
+	const path = normalizePath(join(projectDir, ".clangd"));
+	const raw = fs.readText(path);
+	if (!raw) return { notes: [`no ${path} (clangd uses its built-in defaults plus --compile-commands-dir from the client)`] };
+	const setting = /^\s*CompilationDatabase:\s*(.+)$/m.exec(raw)?.[1]?.trim();
+	const notes: string[] = [];
+	if (!setting) notes.push(`${path} sets no CompileFlags.CompilationDatabase — clangd searches the file's directory and ancestors for a compile database`);
+	return { path, compilationDatabase: setting, raw, notes };
+}
+
+/** Directories clangd will actually search for a compile database, derived from the `.clangd` setting. */
+export function clangdSearchDirs(projectDir: string, config: ClangdConfig): { dirs: string[]; notes: string[] } {
+	const notes: string[] = [];
+	if (config.compilationDatabase && config.compilationDatabase.toLowerCase() !== "auto" && config.compilationDatabase.toLowerCase() !== "off") {
+		const dir = isAbsolutePath(config.compilationDatabase) ? normalizePath(config.compilationDatabase) : normalizePath(join(projectDir, config.compilationDatabase));
+		notes.push(`.clangd CompilationDatabase: ${config.compilationDatabase} → clangd reads ${dir}`);
+		return { dirs: [dir], notes };
+	}
+	if (config.compilationDatabase?.toLowerCase() === "off") {
+		notes.push(".clangd CompilationDatabase: off — clangd has no compile database by design");
+		return { dirs: [], notes };
+	}
+	const candidates = [".vscode/unreal-clangd", "Intermediate/Build/Windows/UnrealBuildTool", "Intermediate/Build/Win64/UnrealBuildTool", ".vscode", "."].map((rel) => normalizePath(join(projectDir, rel)));
+	notes.push(config.compilationDatabase ? ".clangd CompilationDatabase: auto → clangd searches the source directory and its ancestors" : "no CompilationDatabase setting → clangd searches the source directory and its ancestors");
+	return { dirs: candidates.filter((dir) => existsSync(dir)), notes };
+}
+
+/** Response files Epic's generator writes with the JSON: their mtime vs the JSON's is the diagnosis. */
+export function responseFileStatus(dir: string, dbAgeMs: number): { files: { path: string; ageMs: number; lines: number }[]; note?: string } {
+	let names: string[] = [];
+	let rspNames: string[] = [];
+	try {
+		names = readdirSync(dir);
+		rspNames = names.filter((name) => /^compilecommands.*\.rsp$/i.test(name) || /\.rsp$/i.test(name));
+	} catch {
+		return { files: [] };
+	}
+	const files = rspNames
+		.filter((name) => !/\.(obj|log|cache|pdb|json)$/i.test(name))
+		.map((name) => {
+			const path = normalizePath(join(dir, name));
+			let ageMs = -1;
+			let lines = 0;
+			try {
+				ageMs = Date.now() - statSync(path).mtimeMs;
+				lines = readFileSync(path, "utf8").split(/\r?\n/).length;
+			} catch {
+				/* unreadable */
+			}
+			return { path, ageMs, lines };
+		});
+	if (!files.length) return { files };
+	const newer = files.filter((file) => file.ageMs >= 0 && file.ageMs < dbAgeMs);
+	const days = (ms: number) => (Math.round((ms / 86400000) * 10) / 10).toFixed(1);
+	return {
+		files,
+		note: newer.length
+			? `${newer.map((file) => `${baseName(file.path)} (${days(file.ageMs)} days, ${file.lines} lines)`).join(", ")} are NEWER than the compile database (${days(dbAgeMs)} days): the include paths are current, the file list is not`
+			: undefined,
+	};
+}
+
+/** Does this file have a compile command in this database? The honest per-file gate. */
+export function compileCommandFor(dbPath: string, file: string): { found: boolean; entry?: CompileEntry } {
+	const want = normalizePath(file).toLowerCase();
+	const entry = readCompileCommands(dbPath).find((candidate) => normalizePath(candidate.file).toLowerCase() === want);
+	return entry ? { found: true, entry } : { found: false };
+}
+
+export interface CompileDbInventoryEntry {
+	key: string;
+	dir: string;
+	path: string;
+	entries: number;
+	bytes: number;
+	ageMs: number;
+}
+
+export function listCompileDbs(root = cacheDir()): CompileDbInventoryEntry[] {
+	const base = normalizePath(join(root, "compiledb"));
+	let keys: string[] = [];
+	try {
+		keys = readdirSync(base);
+	} catch {
+		return [];
+	}
+	const out: CompileDbInventoryEntry[] = [];
+	for (const key of keys) {
+		const dir = normalizePath(join(base, key));
+		const path = normalizePath(join(dir, "compile_commands.json"));
+		if (!existsSync(path)) continue;
+		let bytes = 0;
+		let ageMs = -1;
+		try {
+			const stat = statSync(path);
+			bytes = stat.size;
+			ageMs = Date.now() - stat.mtimeMs;
+		} catch {
+			continue;
+		}
+		out.push({ key, dir, path, entries: readCompileCommands(path).length, bytes, ageMs });
+	}
+	return out.sort((a, b) => a.ageMs - b.ageMs);
+}
+
+/** Cache bytes for a subtree (`du`-like, no external tool). */
+export function dirBytes(dir: string): number {
+	let total = 0;
+	let entries: { name: string; isDirectory(): boolean; isSymbolicLink(): boolean }[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return 0;
+	}
+	for (const entry of entries) {
+		const abs = join(dir, entry.name);
+		if (entry.isSymbolicLink()) continue;
+		if (entry.isDirectory()) total += dirBytes(abs);
+		else {
+			try {
+				total += statSync(abs).size;
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+	return total;
+}
+
+export interface InstallResult {
+	ok: boolean;
+	/** Always named: even a failed copy tells the caller which path was attempted. */
+	path: string;
+	clangdSnippet: string;
+	notes: string[];
+	warnings: string[];
+}
+
+/**
+ * Copy a generated database to where clangd actually reads it, and print the exact `.clangd` lines.
+ *
+ * The copy is the opt-in half of the wiring. pi-unreal never rewrites `.clangd`: that file carries the
+ * developer's flag removals and the clang-cl forcing, and the Unreal-clangd extension owns
+ * `.vscode/settings.json`, so the tool prints the two lines to merge and leaves the merge to the
+ * developer (field-findings 2026-10-28 §6: the answer must name the live clangd directory, not print a
+ * third location the session never reads).
+ */
+export function installCompileDb(opts: { sourcePath: string; destDir: string; fileName?: string }): InstallResult {
+	const snippet = `CompileFlags:\n  CompilationDatabase: ${normalizePath(opts.destDir)}`;
+	const dir = normalizePath(opts.destDir);
+	const path = normalizePath(join(dir, opts.fileName ?? "compile_commands.json"));
+	// `path` is required on every result: a failed install still names the path it attempted.
+	if (!existsSync(opts.sourcePath)) return { ok: false, path, clangdSnippet: snippet, notes: [`source database missing: ${opts.sourcePath}`], warnings: ["nothing installed"] };
+	try {
+		mkdirSync(dir, { recursive: true });
+		copyFileSync(opts.sourcePath, path);
+	} catch (error) {
+		return { ok: false, path, clangdSnippet: snippet, notes: [`copy failed: ${String(error)}`], warnings: ["nothing installed"] };
+	}
+	return {
+		ok: true,
+		path,
+		clangdSnippet: snippet,
+		notes: [
+			`installed ${path}`,
+			`merge into the project's .clangd (pi-unreal does not write that file — it carries your flag removals and forces clang-cl):\n${snippet}`,
+			"restart clangd so the new database is picked up (VS Code: 'Developer: Restart Language Server'; the clangd-server MCP reconnects on its next call)",
+			"the database encodes this machine's absolute paths — keep it out of git, regenerate after engine/SDK changes",
+		],
+		warnings: [],
+	};
 }

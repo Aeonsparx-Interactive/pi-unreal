@@ -15,7 +15,7 @@ import { Type } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 
 import { normalizePath, realFs, truncateLines, type JsonValue } from "./util.ts";
-import { buildContext, compileDbReport, fileContext, headerReport, indexBuild, indexStatus, symbolList, symbolLookup, type Scope } from "./tools.ts";
+import { buildContext, callSitesReport, clangdHealthReport, compileDbReport, fileContext, headerReport, indexBuild, indexStatus, pruneReport, symbolList, symbolLookup, type Scope } from "./tools.ts";
 
 /* ──────────────────────────────────────────────────────────────────────────── schemas */
 
@@ -79,7 +79,7 @@ const ContextParams = Type.Object({
 
 const IndexParams = Type.Object({
 	cwd: CwdSchema,
-	action: Type.Union([Type.Literal("build"), Type.Literal("status"), Type.Literal("headers"), Type.Literal("compiledb")], { description: "'build' creates or refreshes a symbol index. 'status' lists what is cached, what each index covers by root kind, and what building will cost. 'headers' builds the path-only header index and answers 'does this header exist in this engine version' (walks file paths, no content read: seconds). 'compiledb' runs UnrealBuildTool -Mode=GenerateClangDatabase and normalizes it for clangd (minutes, ~1 GB for the engine scope)." }),
+	action: Type.Union([Type.Literal("build"), Type.Literal("status"), Type.Literal("headers"), Type.Literal("compiledb"), Type.Literal("prune"), Type.Literal("clangd"), Type.Literal("callsites")], { description: "'build' creates or refreshes a symbol index. 'status' lists what is cached, what each index covers by root kind, the root set current lookups ask for, near-miss index keys, reclaimable cache bytes, and the generated compile databases. 'headers' builds the path-only header index and answers 'does this header exist in this engine version' (walks file paths, no content read: seconds). 'compiledb' runs UnrealBuildTool -Mode=GenerateClangDatabase and normalizes it for clangd (minutes, ~1 GB for the engine scope); pass check <file> for the clangd --check proof and installTo <dir> to copy it where clangd reads. 'clangd' is the compiler-free clangd health probe: reads the project's .clangd, counts the live database against the translation units on disk, names deleted files and uncovered sources, and reports the per-file compile-command gate. 'prune' deletes the indexes status marks reclaimable. 'callsites' is an opt-in bounded text pass over a module's .cpp tree listing candidate rows that mention a member (candidates, not call edges)." }),
 	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("engine"), Type.Literal("project+engine")], { description: "Index scope for 'build': 'project' (default, seconds) or 'engine' (Engine/Source areas + the project's enabled plugin roots; minutes the first time). For 'headers': 'engine' (default) = engine sources + every Engine/Plugins tree, 'project' = project + its plugins, 'project+engine' = both. For 'compiledb': 'project' (default) = project + enabled plugin sources, 'project+engine' adds all of Engine/Source and Engine/Plugins." })),
 	mode: Type.Optional(Type.Union([Type.Literal("definitions"), Type.Literal("full")], { description: "'definitions' = symbol -> file:line only (default, fast). 'full' also records per-file include sets and needs UnrealBuildTool Query (~7s, no compiler)." })),
 	name: Type.Optional(Type.String({ description: "For action 'headers': the header to answer, e.g. 'MoverState.h', 'PhysicsControlComponent.h', or a partial path 'Mover/Public/MoverTypes.h'. Absent = build/report only." })),
@@ -88,6 +88,12 @@ const IndexParams = Type.Object({
 	platform: PlatformSchema,
 	configuration: ConfigurationSchema,
 	refresh: Type.Optional(Type.Boolean({ description: "Force a rebuild, and re-run UnrealBuildTool Query in 'full' mode. Default false." })),
+	file: Type.Optional(Type.String({ description: "For 'clangd': a source file to gate (is there a compile command for it in the database clangd reads, and in the generated one?). For 'callsites': the member to search, e.g. 'ProduceInput_Implementation'." })),
+	check: Type.Optional(Type.String({ description: "For 'compiledb' and 'clangd': run clangd --check on this file with the generated database (a syntax gate, NOT a link check)." })),
+	installTo: Type.Optional(Type.String({ description: "For 'compiledb': copy the normalized database into this directory — the one clangd actually reads (e.g. <project>/.vscode/unreal-clangd) — and print the exact .clangd CompileFlags: CompilationDatabase lines to merge. pi-unreal never writes .clangd itself." })),
+	module: Type.Optional(Type.String({ description: "For 'callsites': restrict the text pass to this module (default: the modules the symbol's declarations live in)." })),
+	query: Type.Optional(Type.Boolean({ description: "For 'prune': also delete the cached UnrealBuildTool Query JSON (it is re-run in seconds when needed). Default false." })),
+	compileDb: Type.Optional(Type.Boolean({ description: "For 'prune': also delete the generated compile databases. Default false." })),
 });
 
 /* ──────────────────────────────────────────────────────────────────────────── rendering */
@@ -374,7 +380,7 @@ export const unrealIndex = defineTool({
 			if (out.name) {
 				lines.push(`  '${out.name}': ${out.exists ? "EXISTS" : "does NOT exist as a file path in this engine version"}`);
 				for (const row of out.found) lines.push(`    ${row.file}  [${row.module}${row.plugin ? ` · plugin ${row.plugin} [${row.pluginSource}] EnabledByDefault ${row.enabledByDefault} · .uproject reference ${row.referencedInUproject ? "yes" : "NO"}` : ""}]`);
-				if (out.candidates.length) lines.push(`  closest real file names (files, not types):\n${out.candidates.map((row) => `    ${row.file}  [${row.module}]`).join("\n")}`);
+				if (out.candidates.length) lines.push(`  closest real file names (files, not types):\n${out.candidates.map((row) => `    ${row.file}  [${row.module}]${row.reason ? `  (${row.reason})` : ""}`).join("\n")}`);
 			}
 			const text = [...lines, ...out.notes.map((n) => `· ${n}`), ...(out.warnings ?? []).map((w) => `! ${w}`)].join("\n");
 			return result(text, out as unknown as Record<string, JsonValue>, Boolean(out.name) && !out.exists);
@@ -388,6 +394,8 @@ export const unrealIndex = defineTool({
 				platform: params.platform,
 				configuration: params.configuration,
 				refresh: params.refresh,
+					check: params.check,
+				installTo: params.installTo,
 				fs: realFs,
 			});
 			const text = [
@@ -398,6 +406,48 @@ export const unrealIndex = defineTool({
 				...(db.warnings ?? []).map((w) => `! ${w}`),
 			].join("\n");
 			return result(text, db as unknown as Record<string, JsonValue>, !db.ok);
+		}
+
+		if (params.action === "prune") {
+			const out = pruneReport({ query: params.query, compileDb: params.compileDb });
+			const text = [
+				`unreal_index prune → ${out.removed.length} entr${out.removed.length === 1 ? "y" : "ies"}, ${out.freedMb} reclaimed (cache ${(out.beforeBytes / 1024 / 1024).toFixed(1)} MB → ${(out.afterBytes / 1024 / 1024).toFixed(1)} MB)`,
+				...out.removed.map((entry) => `  deleted ${entry.kind} ${entry.key} (${entry.mb}) — ${entry.reason}`),
+				...out.kept.map((entry) => `  kept ${entry.kind} ${entry.key} (${entry.mb}) — healthy, reachable by a current lookup key`),
+				...out.notes.map((n) => `· ${n}`),
+				...out.warnings.map((w) => `! ${w}`),
+			].join("\n");
+			return result(text, out as unknown as Record<string, JsonValue>);
+		}
+
+		if (params.action === "clangd") {
+			const out = await clangdHealthReport({
+				cwd: params.cwd ?? ctx.cwd,
+				file: params.check ?? params.file,
+				check: Boolean(params.check),
+				scope: (params.scope === "project+engine" ? "project+engine" : "project") as "project" | "project+engine",
+				fs: realFs,
+			});
+			const text = [`unreal_index clangd → ${out.ok ? "a live compile database exists" : "NO live compile database — clangd has nothing to compile with"}`, ...out.notes.map((n) => `· ${n}`), ...out.warnings.map((w) => `! ${w}`)].join("\n");
+			return result(text, out as unknown as Record<string, JsonValue>, !out.ok);
+		}
+
+		if (params.action === "callsites") {
+			const out = await callSitesReport({
+				cwd: params.cwd ?? ctx.cwd,
+				symbol: params.file ?? params.name ?? "",
+				module: params.module ? [params.module] : undefined,
+				scope: (params.scope === "engine" ? "engine" : "project") as "project" | "engine",
+				engineAreas: params.engineAreas,
+				fs: realFs,
+			});
+			const text = [
+				`unreal_index callsites '${out.symbol}' → ${out.rows.length} candidate row(s) from ${out.filesScanned} .cpp file(s) in ${out.seconds.toFixed(1)}s`,
+				...out.rows.slice(0, 40).map((row) => `  ${row.kind}  ${shortPath(row.file, params.cwd ?? ctx.cwd)}:${row.line}${row.module ? `  [${row.module}]` : ""}`),
+				...out.notes.map((n) => `· ${n}`),
+				...out.warnings.map((w) => `! ${w}`),
+			].join("\n");
+			return result(text, out as unknown as Record<string, JsonValue>, !out.rows.length);
 		}
 
 		const out = await indexBuild({

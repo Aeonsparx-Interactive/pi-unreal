@@ -130,8 +130,12 @@ export function classifyRoot(root: string, options: { projectRoot?: string; engi
 	const engine = options.engineRoot ? normalizePath(options.engineRoot).toLowerCase() : undefined;
 	if (project && (r === project || r.startsWith(`${project}/`))) return "project";
 	if (engine && r.startsWith(`${engine}/`)) {
-		if (r.includes("/engine/plugins/")) return "engine-plugin";
-		if (r.includes("/engine/source/")) return "engine-source";
+		// Prefix test on the part AFTER the engine root: `Engine/Plugins` as a root (the whole plugin tree,
+		// which is what a header scan dials) has no trailing segment, and `includes("/engine/plugins/")` read
+		// it as "other-plugin".
+		const rest = r.slice(engine.length).replace(/^\/+/, "");
+		if (rest === "engine/plugins" || rest.startsWith("engine/plugins/")) return "engine-plugin";
+		if (rest === "engine/source" || rest.startsWith("engine/source/")) return "engine-source";
 		return "other-plugin";
 	}
 	return "other-plugin";
@@ -738,6 +742,26 @@ export function lookupSymbol(index: IndexState, query: string, options: { limit?
 	return out.sort((a, b) => a.rank - b.rank || a.scope.localeCompare(b.scope) || a.symbol.localeCompare(b.symbol)).slice(0, limit);
 }
 
+/**
+ * Rows whose QUALIFIED member equals `member` (the `Owner:Member` shape). `lookupSymbol` cannot answer
+ * this: its exact pass matches a bare `ProduceInput_Implementation` row first, and its later passes only
+ * run when the exact pass is empty — so a qualified member family is invisible to it. UHT-generated
+ * `_Implementation` thunks live exclusively as qualified rows, which is why the 0-row note needs this
+ * scan (field-findings 2026-10-28 §8). Linear pass over the definitions TSV, like the substring pass.
+ */
+export function findRowsByMember(index: IndexState, member: string, options: { limit?: number } = {}): DefRow[] {
+	const needle = probe(baseName(member));
+	const limit = Math.max(1, options.limit ?? 200);
+	const out: DefRow[] = [];
+	forEachDefRow(index, (row) => {
+		const split = splitQualified(row.symbol);
+		if (!split.member || probe(split.member) !== needle) return true;
+		out.push(row);
+		return out.length < limit;
+	});
+	return out;
+}
+
 /** Symbol names starting with a prefix — the cheap answer to "what is `Lp` in this project". */
 export function listSymbols(index: IndexState, prefix: string, options: { limit?: number; kind?: string; module?: string } = {}): { symbol: string; kind: string; file: string; line: number; module: string }[] {
 	const path = defPath(index);
@@ -998,14 +1022,54 @@ export function moduleRefsFromQuery(queryFiles: { moduleReferences: string }, mo
 
 /* ──────────────────────────────────────────────────────────────────────── registry */
 
-/** Index key: mode + sorted roots (full adds the target identity, because include sets are target-specific). */
-export function indexKeyFor(input: { mode: "definitions" | "full"; roots: string[]; scope?: IndexScope; target?: string; platform?: string; configuration?: string }): string {
+/**
+ * Index key.
+ *
+ * Project/plugin scope: mode + sorted roots (full adds the target identity, because include sets are
+ * target-specific) — the root set IS the coverage claim, so it must be in the key.
+ *
+ * Engine scope: `(engineRoot, engineAreas)`, never the root list. An engine-scope root list contains
+ * the project's enabled plugin roots, so keying on it made an unrelated `.uproject` edit (a plugin
+ * reference add, 25 → 28 `.uproject` refs, +8 module roots) change the engine key and orphan a
+ * 251 MB / 1,240,246-symbol engine scan (measured 2026-10-28, `idx-engine-defs-6ee690c3fe45`). The
+ * header index has always excluded project roots from its key, and it survived the same edits: that
+ * asymmetry is the fix. The engine's identity is the install plus the areas scanned; the plugin roots
+ * a `.uproject` enables belong to the project index, and a scope `engine`/`all` answer is the union of
+ * the two indexes (`scopeIndexesFor`).
+ */
+export function indexKeyFor(input: {
+	mode: "definitions" | "full";
+	roots: string[];
+	scope?: IndexScope;
+	target?: string;
+	platform?: string;
+	configuration?: string;
+	/** Engine-scope identity: the engine install, plus the areas asked for. */
+	engineRoot?: string;
+	areas?: string[];
+}): string {
 	const roots = input.roots.map((root) => normalizePath(root).toLowerCase()).sort();
-	const parts = [input.mode, input.scope ?? "", ...roots];
+	const engineScope = input.scope === "Engine";
+	const areas = (input.areas ?? DEFAULT_ENGINE_AREAS).map((area) => area.toLowerCase());
+	const parts = engineScope
+		? [input.mode, "Engine", normalizePath(input.engineRoot ?? "").toLowerCase(), ...areas]
+		: [input.mode, input.scope ?? "", ...roots];
 	if (input.mode === "full") parts.push(input.target ?? "", input.platform ?? "", input.configuration ?? "");
 	const fingerprint = shortHash(parts.join("|"));
-	const label = input.scope === "Engine" ? "engine" : (input.roots[0] ?? roots[0] ?? "index").split("/").filter(Boolean).pop() ?? "index";
+	const label = engineScope ? "engine" : (input.roots[0] ?? roots[0] ?? "index").split("/").filter(Boolean).pop() ?? "index";
 	return `idx-${label.replace(/[^a-z0-9]/gi, "")}-${input.mode === "full" ? "full" : "defs"}-${fingerprint}`;
+}
+
+/** The engine key the pre-1.2 scanner wrote for these roots: `roots` inside the fingerprint. */
+export function legacyEngineIndexKeyFor(mode: "definitions" | "full", roots: string[]): string {
+	return indexKeyFor({ mode, roots, scope: "Engine" });
+}
+
+/** True for an engine-scope index keyed by its root list (the shape that made `.uproject` edits fatal). */
+export function isLegacyEngineIndexKey(key: string, meta: Pick<IndexMeta, "scope" | "roots">): boolean {
+	if (meta.scope !== "Engine") return false;
+	const roots = meta.roots.map((root) => normalizePath(root).toLowerCase()).sort();
+	return key === indexKeyFor({ mode: "definitions", roots, scope: "Engine" }) || key === indexKeyFor({ mode: "full", roots, scope: "Engine" });
 }
 
 export function indexesRoot(): string {
@@ -1083,8 +1147,27 @@ export function pickIndex(filter: { key?: string; mode?: "definitions" | "full";
 	}
 	const engineRoot = filter.engineRoot ? normalizePath(filter.engineRoot).toLowerCase() : "";
 	if (!pool.length && engineRoot) pool = all.filter((state) => state.healthy && normalizePath(state.meta.engineRoot ?? "").toLowerCase() === engineRoot && (!filter.scope || state.scope === filter.scope) && (!want || rootsSignature(state.meta.roots ?? []) === want));
+	// The near miss, in root delta: the point of a miss is that a scan exists whose coverage is *almost*
+	// this call's coverage. Naming keys alone made a 251 MB engine index invisible for a week.
+	if (!pool.length && want) {
+		const near = all.filter((state) => state.healthy && (!filter.mode || state.meta.mode === filter.mode) && (!filter.scope || state.scope === filter.scope) && rootsSignature(state.meta.roots ?? []) !== want);
+		for (const state of near.slice(0, 3)) notes.push(`near miss: index ${state.key}${isLegacyEngineIndexKey(state.key, state.meta) ? " (keyed by its root set: pre-1.2 engine keys, no longer produced)" : ""} covers ${summarizeRootKinds(state.meta.roots ?? [], { projectRoot: state.meta.projectRoot, engineRoot: state.meta.engineRoot }).map((entry) => `${entry.count} ${entry.kind}`).join(", ")}${state.meta.areas?.length ? ` (engineAreas ${state.meta.areas.join(", ")})` : ""} — ${rootDeltaNote(state, filter.roots ?? [])}; reuse requires the same root set, so this call does not search it`);
+	}
 	if (!pool.length) notes.push(all.length ? `${all.length} index/indices exist, none healthy and matching this scope` : "no symbol index built yet");
 	return { index: pool[0], candidates: pool, notes };
+}
+
+/** "What is the gap between that index and these roots?" — the honest form of a near miss. */
+export function rootDeltaNote(index: IndexState, wantRoots: string[]): string {
+	const want = new Set(rootsSignature(wantRoots).split("|").filter(Boolean));
+	const have = new Set(rootsSignature(index.meta.roots ?? []).split("|").filter(Boolean));
+	const onlyIndex = [...have].filter((dir) => !want.has(dir));
+	const onlyCall = [...want].filter((dir) => !have.has(dir));
+	const parts: string[] = [];
+	if (onlyCall.length) parts.push(`missing ${onlyCall.length} of this call's root(s)`);
+	if (onlyIndex.length) parts.push(`covering ${onlyIndex.length} root(s) this call does not scan`);
+	if (!parts.length) parts.push(`same root set, different key (mode/scope/target identity differs): ${[...want].length} roots`);
+	return parts.join(", ");
 }
 
 /* ────────────────────────────────────────────────────────── header (path-only) index */
@@ -1245,6 +1328,8 @@ export interface HeaderRow {
 	kind: string;
 	/** `exact` = that file name exists; `suffix` = a path suffix match; `token` = shares name tokens. */
 	match: "exact" | "suffix" | "token";
+	/** Why this row ranks where it does: `stem containment (moverstate ⊂ moverstatetypes) · mover plugin family`, `generic name tokens only (state) — related, not a lead`. */
+	reason?: string;
 }
 
 function readHeaderRows(index: HeaderIndex): { file: string; module: string; kind: string }[] {
@@ -1287,24 +1372,138 @@ export function lookupHeaderPaths(index: HeaderIndex, name: string, options: { l
 	return out.slice(0, limit);
 }
 
-/** Real header names related to `name` (for the "this header does not exist, here is what does" answer). */
-export function suggestHeaderPaths(index: HeaderIndex, name: string, options: { limit?: number } = {}): HeaderRow[] {
+/**
+ * Real header names related to `name` (the "this header does not exist, here is what does" answer),
+ * ranked by how much of the queried NAME the candidate carries.
+ *
+ * Token counting alone ranked `MoverComponent.h` and unrelated plugins' `*StateTypes.h` above the
+ * plugin's own state headers, and a bare list of paths read as a lead (field-findings 2026-10-28 §5).
+ * So: exact stem, then stem containment (`MoverState` ⊂ `MoverStateTypes`); distinctive tokens only
+ * (a hit on `state`/`types`/`table`/`data`/`info`/`log` is a name-shape echo — score capped, and the
+ * reason says so in words); plugin-family boost for the plugin the query names; public-header boost;
+ * shortest leaf as the last tie-break; unrelated plugin families capped.
+ *
+ * Every row carries `reason` so the caller can print why a row is where it is.
+ */
+const GENERIC_HEADER_TOKENS = new Set(["state", "states", "type", "types", "table", "tables", "data", "info", "information", "log", "logs", "base", "setting", "settings", "config", "configs", "args", "params", "result", "results", "impl", "implementation", "interface", "interfaces", "manager", "managers", "utils", "common", "shared", "names"]);
+
+/** Is `needle` a contiguous run inside `haystack`? Token-boundary containment (nameTokens order). */
+function containsSequence(haystack: string[], needle: string[]): boolean {
+	if (!needle.length || needle.length > haystack.length) return false;
+	for (let start = 0; start + needle.length <= haystack.length; start += 1) {
+		if (needle.every((token, offset) => haystack[start + offset] === token)) return true;
+	}
+	return false;
+}
+
+/** Plugin family of a header path: `…/Plugins/<Category>/<Plugin>/Source/…`, `…/Plugins/<Plugin>/Source/…`, project `Plugins/<Plugin>/Source/…`, `…/Mods/<Plugin>/Source/…`. */
+export function pluginFamilyOfPath(file: string): string | undefined {
+	const parts = normalizePath(file).split("/");
+	for (let i = 0; i < parts.length - 1; i++) {
+		if (!/^plugins$/i.test(parts[i] ?? "")) continue;
+		for (let j = i + 1; j < parts.length; j++) {
+			if (/^source$/i.test(parts[j] ?? "")) return parts[j - 1];
+		}
+	}
+	const mods = parts.findIndex((part) => /^mods$/i.test(part));
+	return mods >= 0 && mods + 1 < parts.length ? parts[mods + 1] : undefined;
+}
+
+/** The plugin family a query names: `Mover/Public/MoverState.h` → `mover`; `MoverState.h` → none. */
+export function pluginFamilyOfQuery(name: string): string | undefined {
+	const family = pluginFamilyOfPath(name);
+	if (family) return family;
+	const parts = normalizePath(name).split("/");
+	return parts.length > 1 ? parts[parts.length - 2] : undefined;
+}
+
+export function suggestHeaderPaths(index: HeaderIndex, name: string, options: { limit?: number; family?: string; maxUnrelatedFamilies?: number } = {}): HeaderRow[] {
 	const stem = baseName(name).replace(/\.(h|hpp|hxx|inl)$/i, "");
 	const queryTokens = nameTokens(stem);
 	if (!queryTokens.length) return [];
 	const limit = options.limit ?? 8;
-	const out: { row: HeaderRow; score: number }[] = [];
+	const family = (options.family ?? pluginFamilyOfQuery(name))?.toLowerCase();
+	const lowerQuery = stem.toLowerCase();
+	const allDistinctive = queryTokens.filter((token) => !GENERIC_HEADER_TOKENS.has(token));
+	// A bare file name carries no path, so its plugin family comes from the query's own tokens: 'MoverState.h'
+	// names the Mover plugin, 'ChooserTable.h' names Chooser. Exact family-token equality only — 'mover' must
+	// not claim MoverTests, ChaosMover or MoverCVDEditor.
+	const matchedFamilies = new Set(queryTokens.map((token) => token.toLowerCase()));
+	if (family) matchedFamilies.add(family);
+	const out: { row: HeaderRow; score: number; sameFamily: boolean }[] = [];
 	for (const row of readHeaderRows(index)) {
-		const rowTokens = nameTokens(baseName(row.file).replace(/\.(h|hpp|hxx|inl)$/i, ""));
+		const leaf = baseName(row.file);
+		const rowStem = leaf.replace(/\.(h|hpp|hxx|inl)$/i, "");
+		const rowTokens = nameTokens(rowStem);
+		const hits = queryTokens.filter((token) => rowTokens.includes(token));
+		const distinctive = hits.filter((token) => !GENERIC_HEADER_TOKENS.has(token));
+		const rowFamily = pluginFamilyOfPath(row.file)?.toLowerCase();
+		const sameFamily = Boolean(rowFamily && matchedFamilies.has(rowFamily));
+		const lowerRow = rowStem.toLowerCase();
 		let score = 0;
-		for (const token of queryTokens) if (rowTokens.includes(token)) score++;
-		if (!score) continue;
-		if (score === queryTokens.length) score += 2;
+		const reasons: string[] = [];
+		if (lowerRow === lowerQuery) {
+			score += 64;
+			reasons.push("same stem");
+		} else {
+			// Token-boundary containment, both directions: 'moverstate' ⊂ 'moverstatetypes' and
+			// 'moverstatetypes' ⊃ 'moverstate'. A raw substring test also fires on
+			// 'moverstate' ⊂ 'chaosmoverstatemachine', which is the ranking bug the 2026-10-28 report
+			// measured (ChaosMoverStateMachine.h above Mover/MoverTypes.h for query 'MoverState.h'), so
+			// containment needs a token sequence of at least 2 on the contained side.
+			const contained = queryTokens.length >= 2 && containsSequence(rowTokens, queryTokens);
+			const contains = rowTokens.length >= 2 && containsSequence(queryTokens, rowTokens);
+			if (contained || contains) {
+				score += 24;
+				reasons.push(contained ? `stem containment (${queryTokens.join("+")} ⊂ ${rowTokens.join("+")})` : `query stem contains ${rowTokens.join("+")}`);
+			}
+		}
+		score += 4 * distinctive.length;
+		if (distinctive.length && distinctive.length === allDistinctive.length) {
+			score += 8;
+			reasons.push(`every distinctive token of '${stem}' (${allDistinctive.join(", ")})`);
+		}
+		if (distinctive.length) reasons.push(`name tokens ${distinctive.join("/")}`);
+		if (sameFamily) {
+			// Family dominates: for 'MoverState.h' the Mover plugin's own headers are the rows an agent
+			// should act on, and a cross-plugin stem hit must not outrank them (report §5).
+			score += 40;
+			reasons.push(`${rowFamily} plugin family`);
+			if (family && row.module?.toLowerCase() === family) {
+				// The plugin's primary module is where its core types live; sibling modules
+				// (MoverCVDEditor, MoverTests) are weaker leads for the same stem.
+				score += 8;
+				reasons.push(`${family} primary module`);
+			}
+			if (!lowerQuery.endsWith("types") && /types$/i.test(rowStem)) {
+				// UE convention: `<Area>Types.h` is where a module declares its core types — what a
+				// name-shape probe for a type is after (report §5 names MoverTypes.h,
+				// MoverSimulationTypes.h, MoverDataModelTypes.h as the rows that should lead).
+				score += 4;
+				reasons.push("type-declaration header (UE '*Types.h' convention)");
+			}
+		}
+		if (!distinctive.length) {
+			if (!hits.length) continue;
+			score = Math.min(score, 2);
+			reasons.push(`generic name tokens only (${hits.join("/")}) — related to '${stem}' by name shape, not a lead`);
+		}
 		if (row.kind === "public-header") score += 1;
-		out.push({ row: { ...row, match: "token" }, score });
+		out.push({ row: { ...row, match: "token", reason: reasons.join(" · ") }, score, sameFamily });
 	}
-	out.sort((a, b) => b.score - a.score || baseName(a.row.file).length - baseName(b.row.file).length || a.row.file.localeCompare(b.row.file));
-	return out.slice(0, limit).map((entry) => entry.row);
+	out.sort((a, b) => Number(b.sameFamily) - Number(a.sameFamily) || b.score - a.score || baseName(a.row.file).length - baseName(b.row.file).length || a.row.file.localeCompare(b.row.file));
+	if (!matchedFamilies.size) return out.slice(0, limit).map((entry) => entry.row);
+	const maxUnrelated = options.maxUnrelatedFamilies ?? 3;
+	const kept: typeof out = [];
+	let unrelated = 0;
+	for (const entry of out) {
+		if (entry.sameFamily) kept.push(entry);
+		else if (unrelated < maxUnrelated) {
+			unrelated += 1;
+			kept.push(entry);
+		}
+	}
+	return kept.slice(0, limit).map((entry) => entry.row);
 }
 
 /* ──────────────────────────────────────────────────────────────────────── helpers */
@@ -1365,10 +1564,25 @@ export function moduleFromBuildCs(file: string, moduleNames?: string[]): string 
 		if (!names.length) continue;
 		return pickModuleName(names, leaf, moduleNames);
 	}
-	const marker = parts.indexOf("Source");
-	const candidate = marker >= 0 ? parts[marker + 1] : undefined;
-	if (candidate) return candidate;
-	return parts[parts.length - 2] ?? "root";
+	return moduleFromSourcePath(file) ?? parts[parts.length - 2] ?? "root";
+}
+
+/**
+ * Module from the path shape alone: `<...>/Source/<Module>/<Public|Private>/...`.
+ *
+ * `moduleFromBuildCs` needs a real `*.Build.cs` on disk, so it cannot answer for a file no index has
+ * read (a header in a plugin that was never scanned). The UE module directory layout is the only route
+ * that works from a path string, and it is the route the header-index fallback needs.
+ */
+export function moduleFromSourcePath(file: string): string | undefined {
+	const parts = normalizePath(file).split("/");
+	for (let i = parts.length - 1; i > 0; i--) {
+		if (!/^(public|private|internal|classes|private-header)$/i.test(parts[i] ?? "")) continue;
+		const owner = parts[i - 1];
+		if (owner && !/^(source|modules)$/i.test(owner)) return owner;
+	}
+	const marker = parts.findIndex((part) => /^source$/i.test(part));
+	return marker >= 0 ? parts[marker + 1] : undefined;
 }
 
 /** Module names owned by `dir`: basenames of its `*.Build.cs` files (empty when it owns none). */
@@ -1488,3 +1702,332 @@ export function assembleRoots(options: RootOptions): { roots: ScanRoot[]; notes:
 }
 
 export type { IncludeRef, ScanRoot, SymbolDef };
+
+/* ---------------------------------------------------------------------------
+ * Cache audit and reclaim (field-findings 2026-10-28 §7).
+ *
+ * 481 MB measured, 177 MB of it (37%) unreachable: two engine indexes orphaned by the root-set key,
+ * two indexes in superseded formats, one superseded project index. `status` listed the issues and the
+ * files stayed, and no action existed to delete them. `auditCache` classifies; `pruneCache` deletes
+ * only what the audit marks reclaimable.
+ *
+ * The cache is derived data: every reclaimable entry can be rebuilt by a documented command, so
+ * deletion is safe. `query/` and `compiledb/` are NOT reclaimed by default — UBT Query costs 12 s
+ * per target and a GenerateClangDatabase run costs minutes; deleting them needs an explicit flag.
+ * ------------------------------------------------------------------------- */
+
+export type CacheEntryKind = "index" | "header" | "query" | "compiledb" | "other";
+
+export interface CacheAuditEntry {
+	kind: CacheEntryKind;
+	key: string;
+	dir: string;
+	bytes: number;
+	ageMs: number;
+	/** Set when the entry can be deleted; the reason is printed verbatim. */
+	reclaimable?: string;
+	scope?: string;
+	mode?: string;
+	source?: string;
+	counts?: string;
+}
+
+export interface CacheAudit {
+	cacheDir: string;
+	entries: CacheAuditEntry[];
+	reclaimableBytes: number;
+	keptBytes: number;
+	notes: string[];
+}
+
+function directoryBytes(dir: string): number {
+	let total = 0;
+	let entries: { name: string; isDirectory(): boolean; isSymbolicLink(): boolean }[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return 0;
+	}
+	for (const entry of entries) {
+		if (entry.isSymbolicLink()) continue;
+		const abs = joinPath(dir, entry.name);
+		if (entry.isDirectory()) total += directoryBytes(abs);
+		else {
+			try {
+				total += statSync(abs).size;
+			} catch {
+				/* unreadable file: count as nothing */
+			}
+		}
+	}
+	return total;
+}
+
+function directoryAgeMs(dir: string): number {
+	try {
+		return Date.now() - statSync(dir).mtimeMs;
+	} catch {
+		return 0;
+	}
+}
+
+const megabytes = (bytes: number) => `${(Math.round((bytes / 1024 / 1024) * 10) / 10).toFixed(1)} MB`;
+
+/**
+ * Classify everything in the cache: what is live, what a lookup can no longer reach, and why.
+ *
+ * An entry is reclaimable when (a) its format is superseded, (b) a newer healthy entry shares its
+ * key, (c) it is a pre-1.2 engine key (root-set fingerprint) that 1.2 lookups cannot select,
+ * (d) a recorded root is gone, or (e) its payload file is missing.
+ */
+/**
+ * The key a current lookup would ask for given what this index recorded. Engine scope is keyed by
+ * (engineRoot, engineAreas); project scope by its root set. Used by the cache audit and by `status`,
+ * which must say which entries a lookup can no longer select.
+ */
+export function expectedKeyFor(state: IndexState): string {
+	const meta = state.meta;
+	const areas = meta.areas ?? (state.scope === "Engine" ? areasFromEngineRoots(meta.engineRoot, meta.roots ?? []) : undefined);
+	return indexKeyFor({
+		mode: meta.mode ?? "definitions",
+		roots: state.scope === "Engine" ? [] : meta.roots ?? [],
+		scope: state.scope,
+		target: meta.target,
+		platform: meta.platform,
+		configuration: meta.configuration,
+		engineRoot: meta.engineRoot,
+		areas,
+	});
+}
+
+/** Key fingerprint (trailing hash) only: labels are derived from root names, so a label mismatch is
+ * not evidence that a lookup cannot select an entry — the fingerprint is. */
+export const keyFingerprint = (key: string) => /-([0-9a-f]{8,})$/.exec(key)?.[1] ?? key;
+
+/**
+ * Areas implied by an engine index's roots. Used only to recompute what key a lookup would ask for
+ * (1.2 records the requested areas; pre-1.2 entries recorded roots and fingerprinted them).
+ */
+export function areasFromEngineRoots(engineRoot: string | undefined, roots: string[]): string[] | undefined {
+	if (!engineRoot) return undefined;
+	const areas = new Set<string>();
+	const source = `${normalizePath(engineRoot)}/engine/source/`.toLowerCase();
+	const plugins = `${normalizePath(engineRoot)}/engine/plugins/`.toLowerCase();
+	for (const root of roots) {
+		const lower = normalizePath(root).toLowerCase();
+		if (lower.startsWith(source)) {
+			// Area words are cased the way the dial spells them (the index roots come from
+			// `Engine/Source/Runtime/...`), so recover the casing from the root's own text.
+			const rest = normalizePath(root).slice(source.length).split("/");
+			areas.add(rest[0] ? (rest[0].toLowerCase() === "runtime" ? "Runtime" : rest[0]) : "Runtime");
+		} else if (lower.startsWith(plugins)) {
+			areas.add("Plugins");
+		}
+	}
+	return areas.size ? [...areas].sort() : undefined;
+}
+
+export function auditCache(): CacheAudit {
+	const root = cacheDir();
+	const entries: CacheAuditEntry[] = [];
+	const notes: string[] = [];
+
+	const indexStates = listIndexes();
+	for (const state of indexStates) {
+		const meta = state.meta;
+		const reasons: string[] = [];
+		if (meta.version !== INDEX_VERSION) reasons.push(`format v${meta.version}, current v${INDEX_VERSION} (the format that entry was written in is not read by a lookup)`);
+		if (!meta.defsPath || !existsSync(meta.defsPath)) reasons.push("defs.tsv missing");
+		const deadRoot = (meta.roots ?? []).find((path) => !existsSync(path));
+		if (deadRoot) reasons.push(`root no longer present: ${deadRoot}`);
+		const expectedKey = expectedKeyFor(state);
+		if (keyFingerprint(meta.key) !== keyFingerprint(expectedKey)) {
+			reasons.push(state.scope === "Engine" && isLegacyEngineIndexKey(meta.key, meta)
+				? `keyed by its root set (pre-1.2 engine keys fingerprinted the project's plugin roots): 1.2 keys engine scope by (engineRoot, engineAreas) → ${expectedKey}; no lookup selects this entry`
+				: `no lookup selects this entry: the current key rules compute ${expectedKey}`);
+		}
+		const counts = meta.counts ? `${meta.counts.symbols?.toLocaleString() ?? "?"} symbols / ${(meta.counts.files ?? 0).toLocaleString()} files` : "no counts";
+		entries.push({ kind: "index", key: state.key, dir: state.dir, bytes: directoryBytes(state.dir), ageMs: state.ageMs, reclaimable: reasons.join("; ") || undefined, scope: state.scope, mode: meta.mode, source: meta.source, counts });
+	}
+
+	const headerRoot = headersRoot();
+	if (existsSync(headerRoot)) {
+		for (const index of listHeaderIndexes()) {
+			const reasons: string[] = [];
+			if (index.meta.version !== HEADER_VERSION) reasons.push(`format v${index.meta.version}, current v${HEADER_VERSION}`);
+			if (!index.meta.path || !existsSync(index.meta.path)) reasons.push("headers.tsv missing");
+			const deadRoot = (index.meta.roots ?? []).find((path) => !existsSync(path));
+			if (deadRoot) reasons.push(`root no longer present: ${deadRoot}`);
+			const expectedKey = headerKeyFor({ roots: index.meta.roots ?? [] });
+			if (keyFingerprint(index.meta.key) !== keyFingerprint(expectedKey)) reasons.push(`no lookup selects this entry: the current root set computes ${expectedKey}`);
+			entries.push({ kind: "header", key: index.key, dir: index.dir, bytes: directoryBytes(index.dir), ageMs: index.ageMs, reclaimable: reasons.join("; ") || undefined, mode: "headers", counts: `${(index.meta.files ?? 0).toLocaleString()} header paths from ${(index.meta.roots ?? []).length} roots` });
+		}
+	}
+
+	const keyed = (dir: string, kind: CacheEntryKind, label: string) => {
+		if (!existsSync(dir)) return;
+		for (const name of readdirSync(dir)) {
+			const abs = normalizePath(joinPath(dir, name));
+			let stat: ReturnType<typeof statSync>;
+			try {
+				stat = statSync(abs);
+			} catch {
+				continue;
+			}
+			if (!stat.isDirectory()) continue;
+			entries.push({ kind, key: name, dir: abs, bytes: directoryBytes(abs), ageMs: directoryAgeMs(abs), counts: label });
+		}
+	};
+	keyed(normalizePath(joinPath(root, "query")), "query", "UBT TargetDetails / TargetModuleReferences JSON");
+	keyed(normalizePath(joinPath(root, "compiledb")), "compiledb", "generated clangd-ready compile database");
+
+	if (existsSync(root)) {
+		for (const name of readdirSync(root)) {
+			const abs = normalizePath(joinPath(root, name));
+			let stat: ReturnType<typeof statSync>;
+			try {
+				stat = statSync(abs);
+			} catch {
+				continue;
+			}
+			if (!stat.isFile()) continue;
+			entries.push({ kind: "other", key: name, dir: abs, bytes: directoryBytes(abs), ageMs: directoryAgeMs(abs), counts: "plugin-index cache" });
+		}
+	}
+
+	const reclaimableBytes = entries.reduce((sum, entry) => sum + (entry.reclaimable ? entry.bytes : 0), 0);
+	const keptBytes = entries.reduce((sum, entry) => sum + (entry.reclaimable ? 0 : entry.bytes), 0);
+	notes.push(`cache ${root}: ${megabytes(reclaimableBytes + keptBytes)} total, ${megabytes(reclaimableBytes)} reclaimable (${entries.filter((entry) => entry.reclaimable).length} entries), ${megabytes(keptBytes)} live`);
+	notes.push("reclaimable entries are derived data: rebuild with unreal_index action \"build\" / \"headers\"; query/ and compiledb/ are never deleted without an explicit flag (Query costs ~12 s per target, GenerateClangDatabase costs minutes)");
+	return { cacheDir: root, entries: entries.sort((a, b) => b.bytes - a.bytes), reclaimableBytes, keptBytes, notes };
+}
+
+export interface PruneResult {
+	removed: { kind: CacheEntryKind; key: string; bytes: number; reason: string }[];
+	freedBytes: number;
+	notes: string[];
+	warnings: string[];
+}
+
+/**
+ * Delete every entry `auditCache` marked reclaimable. Nothing healthy is ever removed, and
+ * `query/`, `compiledb/` and the plugin-index cache are left alone.
+ */
+export function pruneCache(opts: { query?: boolean; compileDb?: boolean } = {}): PruneResult {
+	const audit = auditCache();
+	const removed: PruneResult["removed"] = [];
+	const warnings: string[] = [];
+	const drop = (dir: string, kind: CacheEntryKind, key: string, bytes: number, reason: string) => {
+		try {
+			rmSync(dir, { recursive: true, force: true });
+			removed.push({ kind, key, bytes, reason });
+		} catch (error) {
+			warnings.push(`could not delete ${dir}: ${String(error)}`);
+		}
+	};
+	for (const entry of audit.entries) {
+		if (!entry.reclaimable) continue;
+		drop(entry.dir, entry.kind, entry.key, entry.bytes, entry.reclaimable);
+	}
+	for (const flag of ["query", "compileDb"] as const) {
+		if (!opts[flag]) continue;
+		const dir = normalizePath(joinPath(audit.cacheDir, flag === "query" ? "query" : "compiledb"));
+		if (!existsSync(dir)) continue;
+		drop(dir, flag === "query" ? "query" : "compiledb", `${flag}/ (all)`, directoryBytes(dir), `deleted by the explicit ${flag} flag`);
+	}
+	const freedBytes = removed.reduce((sum, entry) => sum + entry.bytes, 0);
+	const notes = removed.length
+		? [`pruned ${removed.length} entr${removed.length === 1 ? "y" : "ies"}, ${megabytes(freedBytes)} freed`, "rebuild what you need: unreal_index action \"build\" scope project (seconds), action \"build\" scope engine (minutes, first build), action \"headers\" (seconds)"]
+		: ["nothing to prune: every cache entry is healthy and reachable by a lookup key"];
+	const left = audit.entries.filter((entry) => !entry.reclaimable).reduce((sum, entry) => sum + entry.bytes, 0);
+	notes.push(`cache now ${megabytes(left)} of live entries`);
+	return { removed, freedBytes, notes, warnings };
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Opt-in call-site pass (field-findings 2026-10-28 §10 item 8).
+ *
+ * The indexes answer declaration questions (who declares what, in which module, at which line). They
+ * do NOT answer "where is this member called from", and this module must not pretend otherwise:
+ * reference edges need a language server. What a bounded text pass CAN do is list candidate .cpp
+ * bodies that mention the name, labelled as candidates. That is a real capability of a text index,
+ * stated at its true cost (tens of seconds per module, cached, opt-in), not a claim of call edges.
+ * ------------------------------------------------------------------------- */
+
+export interface CallSiteRow {
+	file: string;
+	line: number;
+	module?: string;
+	kind: "definition (likely override)" | "call site / mention";
+	text: string;
+}
+
+export interface CallSiteReport {
+	symbol: string;
+	filesScanned: number;
+	truncated: boolean;
+	modules: string[];
+	rows: CallSiteRow[];
+	seconds: number;
+	warnings: string[];
+}
+
+/**
+ * Bounded text pass over a module's `Private` sources: rows that mention `symbol`.
+ *
+ * `kind` is deliberately coarse. A line shaped `void AThing::Member(` is the override's definition;
+ * everything else is a mention. These are candidates, not call edges — the label and the wording are
+ * the honesty the report asks for.
+ */
+export async function collectCallSites(input: { roots: ScanRoot[]; symbol: string; maxFiles?: number; perRootCap?: number }): Promise<CallSiteReport> {
+	const started = Date.now();
+	const { default: fastGlob } = await import("fast-glob");
+	const perRootCap = input.perRootCap ?? 400;
+	const maxFiles = input.maxFiles ?? 2000;
+	const files: { path: string; module?: string; dir: string }[] = [];
+	let truncated = false;
+	for (const root of input.roots) {
+		const found = await fastGlob(["Private/**/*.cpp", "**/*.cpp"], { cwd: root.dir, absolute: true, dot: true, unique: true, ignore: ["**/Intermediate/**", "**/Binaries/**", "**/Saved/**", "**/ThirdParty/**", "**/.git/**"], suppressErrors: true });
+		const kept = found.slice(0, perRootCap).map((path) => ({ path: normalizePath(path), module: root.module, dir: root.dir }));
+		if (found.length > perRootCap) truncated = true;
+		files.push(...kept);
+		if (files.length >= maxFiles) {
+			truncated = true;
+			break;
+		}
+	}
+	files.length = Math.min(files.length, maxFiles);
+	const rows: CallSiteRow[] = [];
+	const name = input.symbol.replace(/^[A-Za-z_][A-Za-z0-9_]*::/, "");
+	// Double-escaped: inside a template literal `\s` is the two-character escape `s`, and `\(` is `(` —
+	// single backslashes produced the regex `(...)^name s*(`, which throws before the scan starts.
+	const definitionShape = new RegExp(`(^|[^A-Za-z0-9_])${name}\\s*\\(`);
+	for (const file of files) {
+		let content: string;
+		try {
+			content = readFileSync(file.path, "utf8");
+		} catch {
+			continue;
+		}
+		if (!content.includes(name)) continue;
+		const lines = content.split(/\r?\n/);
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i]!;
+			if (!definitionShape.test(line)) continue;
+			// A `Type::name(args)` head with no `;` before the body is a definition. Truncating at the
+			// first `{` is what makes a one-line body (`... { CallMoverState(); }`) read as a definition:
+			// testing the whole line for `;` classified every such definition as a call site.
+			const braceAt = line.indexOf("{");
+			const head = (braceAt === -1 ? line : line.slice(0, braceAt)).trim();
+			const isDefinition = new RegExp(`[A-Za-z_][A-Za-z0-9_]*::${name}\\s*\\([^;]*\\)(\\s*const)?\\s*$`).test(head);
+			rows.push({ file: file.path, line: i + 1, module: file.module, kind: isDefinition ? "definition (likely override)" : "call site / mention", text: line.trim().slice(0, 160) });
+			if (rows.length >= 200) {
+				truncated = true;
+				break;
+			}
+		}
+		if (rows.length >= 200) break;
+	}
+	return { symbol: input.symbol, filesScanned: files.length, truncated, modules: [...new Set(files.map((file) => file.module).filter(Boolean))] as string[], rows, seconds: (Date.now() - started) / 1000, warnings: [] };
+}

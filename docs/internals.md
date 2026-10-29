@@ -19,9 +19,10 @@ compiler-free sources:
    modules actually depend on — `class`/`struct`/`enum`/`union`, `UFUNCTION`, `UPROPERTY`,
    delegates, aliases, with `Owner:Member` qualified names and forward declarations marked. In an
    installed engine "engine areas" is not where the gameplay types are: `Engine/Source/Runtime` is the
-   engine's own code, and plugin-shipped types live under `Engine/Plugins/<Category>/<Plugin>/Source/`,
-   so an engine-scope index takes its plugin roots from the `.uproject` (plus an explicit
-   `engineAreas: ["Plugins"]` dial for the rest).
+   engine's own code, and plugin-shipped types live under `Engine/Plugins/<Category>/<Plugin>/Source/`.
+   Since 1.2 an engine-scope index covers **engine roots only** (`Engine/Source/<area>`, plus the
+   `engineAreas: ["Plugins"]` dial); plugin-shipped types reach an engine-scope answer through the
+   **project** index, which is unioned in — see *Engine scope is engine-only* below.
 
 Artifacts live in `$PI_UNREAL_CACHE_DIR/indexes/<key>/` (`meta.json`, `defs.tsv`, `files.tsv`,
 plus `includes.tsv` in `full` mode): plain TSV — greppable, inspectable, shared across sessions
@@ -39,10 +40,10 @@ Measured on this box (UE 5.8.3 installed engine; Lp project with 25 enabled plug
 
 | Scope | Files | Definitions | Cold build |
 | --- | --- | --- | --- |
-| Project + plugins | 2,405 | 38,901 | 6.7 s |
+| Project + plugins | 2,405 | 38,901 | 6.7 s (3,264 files / 50,440 symbols on the 1.2 fixture project, 1.9 s) |
 | Engine `Runtime` (shipped default: 279 module roots) | 18,566 | 436,729 | 57.6 s cold, 5.7 s warm |
-| Engine `Runtime` + 62 enabled plugin roots | 20,966 | 476,327 | 122 s cold, 0.4 s warm |
-| Engine `Runtime` + every `Engine/Plugins` source | 71,004 | 1,240,246 | ~2 min cold (1,996 roots: 279 engine-source + 1,717 engine-plugin) |
+| Engine `Runtime` + 62 enabled plugin roots (1.1 engine key, includes `.uproject` plugin roots) | 20,966 | 476,327 | 122 s cold, 0.4 s warm |
+| Engine `Runtime` + every `Engine/Plugins` source (1.1 engine key) | 71,004 | 1,240,246 | ~2 min cold (1,996 roots: 279 engine-source + 1,717 engine-plugin) |
 | Engine `Runtime/Core` + `Runtime/CoreUObject` | 3,094 | 70,548 | 16 s |
 | Header index (paths only, engine `Runtime` + all `Engine/Plugins`) | 37,788 headers | — | 4.5 s cold, 0.5 s warm |
 | Cached lookup | — | — | ~0.3 s |
@@ -56,21 +57,51 @@ Ranking inside `unreal_symbol`: exact (0) → qualified member (1) → prefix (2
 Forward declarations rank last, so `unreal_symbol AActor` returns
 `Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h:282` (the `UCLASS` declaration), not
 the `class AActor;` line in `PhysicsCollision.h`.
-`unreal_symbol LpGameModeBase` finds `ALpGameModeBase` (the UE prefix is added for you); `unreal_symbol FLpMovementDirectionThresholds:F` finds a single-letter `UPROPERTY` field; `unreal_context LpCharacterTypes.h` resolves a bare file name through the index. Engine areas are derived from module
-dependencies (`.uproject` modules → recursive `PublicDependencyModuleNames` → plugin-supplied
-modules → recursive `PublicDependencyModuleNames` → plugin-supplied
-modules → `Engine/Source/<area>/*`), so the index contains what this project can compile against,
-not the whole engine. An **engine-scope** index is `Engine/Source/<area>` roots *plus the plugin
-roots the `.uproject` enables* — in UE 5.8 most gameplay types ship as plugins (`Mover`,
-`PoseSearch`, `SmartObjects`, `BlendStack`, `StateTree`, `GameplayAbilities`), and an index of
-`Engine/Source/Runtime` alone reports 0 rows for `UMoverComponent` while the project index already
-contains it. Engine plugins the project does **not** reference are in no root: `engineAreas:
-["Plugins"]` adds every `Engine/Plugins` source tree (~2.8× the `Runtime` scan),
-`["Plugins/Animation/PhysicsControl"]` adds one.
+`unreal_symbol LpGameModeBase` finds `ALpGameModeBase` (the UE prefix is added for you); `unreal_symbol FLpMovementDirectionThresholds:F` finds a single-letter `UPROPERTY` field; `unreal_context LpCharacterTypes.h` resolves a bare file name through the index.
+
+Engine areas are derived from module dependencies (`.uproject` modules → recursive
+`PublicDependencyModuleNames` → plugin-supplied modules → recursive `PublicDependencyModuleNames` →
+`Engine/Source/<area>/*`), so the index contains what this project can compile against, not the
+whole engine.
+
+### Engine scope is engine-only (1.2): the union does the plugin work
+
+An **engine-scope** index is `Engine/Source/<area>` roots and, when dialed, `Engine/Plugins` trees.
+It no longer contains the project's enabled plugin roots, and its **key is
+`(engineRoot, engineAreas)`** — not the root list. A lookup with `scope: "engine"` or `"all"` unions
+the project index (which is where `Mover`, `PoseSearch`, `SmartObjects`, `BlendStack`, `StateTree`,
+`GameplayAbilities` live, because the `.uproject` enables them) with the engine index, and prints
+which index produced the answer. Two field findings drove this:
+
+- `UMoverComponent` in scope `engine` returned **0 rows** on a machine with no engine index, while
+  the project index held 105 rows for `MoverInputCmdContext` — a "not in engine" conclusion built on
+  an index that was never searched. `ensureIndex` is unchanged (a minutes-scale scan is still never
+  implicit); `scopeIndexes` asks for the project handle *and* the engine handle.
+- In 1.1 the engine key fingerprinted the root list, and for engine scope that list included the
+  project's plugin roots. Adding 8 plugin module roots (25 → 28 `.uproject` references) changed the
+  key and orphaned `idx-engine-defs-6ee690c3fe45` (251 MB, 1,240,246 symbols, 1,996 roots) and
+  `idx-engine-defs-b8d82464af4a` (84 MB, 476,327 symbols): the next lookup computed
+  `idx-engine-defs-a4bf1a3cfe72` and missed instantly. The header index has always keyed on engine
+  roots alone (`headerKeyFor`, `hdr-UE58-1a40c1c3d516`, 37,788 paths from 1,934 roots) and stayed
+  valid across the same edits; 1.2 gives the symbol index the same property. Legacy root-keyed
+  engine entries are reported as reclaimable by `action: "status"` and deleted by `action: "prune"`
+  (measured on this box: 481 MB of cache, 177 MB of it unreachable — 251 + 84 MB orphaned engine
+  scans, 75 MB of v4-format indexes, superseded project entries).
+
+Engine plugins the project does **not** reference are in no root: `engineAreas: ["Plugins"]` adds
+every `Engine/Plugins` source tree (~2.8× the `Runtime` scan),
+`["Plugins/Animation/PhysicsControl"]` adds one. `scopeForPath` routes a file to a scope, and an
+engine-scope file miss falls back to the project index **before** declaring a miss: plugin headers
+live there, and a 1725-root engine scan is not the price of answering a plugin question.
 
 Every answer states what it scanned: index key, root kinds (`279 engine-source root(s),
 62 engine-plugin root(s)`), and the `engineAreas` it was built with. A 0-row answer is a statement
-about those roots, never about the engine, and it prints the exact next call.
+about those roots, never about the engine, and it prints the exact next call. When an index exists
+over a *different* root set, the answer names it as a near miss — `near miss: index <key> covers 279
+engine-source root(s) (engineAreas Runtime) — covering 1717 root(s) this call does not scan; reuse
+requires the same root set, so this call does not search it` — and `action: "status"` prints the
+current root set next to the keys, because "which key did the last lookup search?" was the question
+the 2026-10-28 session could not answer.
 
 ## Header index (`unreal_index` action `headers`)
 
@@ -95,6 +126,50 @@ preprocessor set lives in a forced include —
 and `unreal_context` reads that file instead of guessing `WITH_*` values. Query is also never
 run with `-NoIntellisense`: that flag produces a syntactically valid skeleton with an empty
 `moduleToCompileSettings`, and `payloadOk()` rejects it.
+
+### Ranking the closest file names (`suggestHeaderPaths`)
+
+The 2026-10-28 session probed `MoverState.h` (not a file in 5.8) and got 8 suggestions in which
+`AnimationWarpRuntime/Public/AnimWarpStateTypes.h`, `GameplayStateTree/Public/GameplayExternal
+Types.h` and `GeometryCore/Internal/InterchangeCubeSurfaceData.h` matched **before** the plugin's own
+`Mover/Public/MoverStateTypes.h`. Cause: the score was
+`+1 public-header, +1 token overlap, +2 all-tokens`, so the *number of name tokens* decided the
+order, and `State`/`Types`/`Table`/`Data` are engine-wide vocabulary.
+
+Ranking is now: same stem `+64` → stem containment `+24` (with the pair named: `stem containment
+(moverstate ⊂ moverstatetypes)`) → `+4` per distinctive token → `+16` when the row lives in the
+query's plugin family → `+1` public header. A candidate with **no** distinctive token hit is capped
+at 2 and labelled `generic name tokens only (state, types) — related to 'moverstate' by name shape,
+not a lead`; the family is taken from the query path (`Plugins/<Category>/<Plugin>/Source`) or its
+directory leaf (`Mover`), and unrelated-plugin rows are capped at 3. Every row carries its
+`reason`, so the answer is auditable: 6 of the 8 `MoverState.h` rows are named `Mover` family
+(`MoverState.h`, `MoverStateTypes.h`, `MoverStateTreeSupport.h`, …), the token-only rows sink.
+
+The family is a **heuristic label, not a proof** — `GeometryCore/Internal/InterchangeCubeSurface
+Data.h` shares `Data` with `MoverSurfaceData.h` and is a different plugin's internal header. It is
+labelled, never deleted.
+
+### The header index as a context fallback
+
+`unreal_context file: "<header>"` on a file no symbol index covers used to dead-end:
+the engine-scope early return (`no index available for engine sources`) never reached the header
+fallback that exists in the index-exists-but-file-missing branch. Now a miss answers, in order:
+
+1. the header index (`file exists in header index hdr-UE58-1a40c1c3d516 (public-header, module
+   PhysicsControl) but is not in any symbol-index root`); the index key, path count, root kinds and
+   age are printed because "the index exists" was the question the session kept asking;
+2. owning plugin + `EnabledByDefault` + `.uproject` reference as separate facts;
+3. module — `PhysicsControl` resolved from the `/Source/<Module>/` path shape, because
+   `moduleFromBuildCs` needs a `*.Build.cs` on disk and a file no index has read has never been read;
+4. target availability from the **Query cache only** (`in LpEditor module graph: yes (…)`,
+   `.uproject reference: NOT referenced`, `EnabledByDefault: true loads at runtime even without a
+   .uproject reference`), with its age (`query cache read: TargetDetails 126 KB, 1d old`). A miss
+   path never starts the ~7 s-per-section Query;
+5. the paid route: `unreal_index action build scope engine engineAreas
+   ["Plugins/Runtime/PhysicsControl"]` (the plugin's own sources, not the whole engine), then re-run.
+
+Engine-scope misses try the **project** index first — plugin headers live there, and a 1,725-root
+engine scan is not the price of a plugin question.
 
 ## clangd enrichment (`unreal_index` action `compiledb`)
 
@@ -125,17 +200,88 @@ database is written to `$PI_UNREAL_CACHE_DIR/compiledb/<target>.<platform>.<conf
 this machine's absolute paths and toolchain version, so it is a machine artifact, never a repo one.
 
 `check: "<file>"` runs `clangd --check` against the result, which is the acceptance test. Measured
-on Lp (UE 5.8.3, installed engine, VS 18 LLVM clangd): UnrealBuildTool 1.5-1.7 s, 4 entries,
-4 response files expanded, 0 switches dropped; `clangd --check` built a 62 MB preamble and
-reported **`All checks completed, 0 errors`** in ~2.6 s.
+on Lp (UE 5.8.3, installed engine, VS 18 LLVM clangd): UnrealBuildTool 1.5-1.9 s, the **current TU
+set of the project scope — 9 entries in 1.9 s** (the 1.0/1.1 snapshot printed 4: two sources had
+been deleted and the database had not been regenerated since), 4 response files expanded, 0 switches
+dropped; `clangd --check` built a 62 MB preamble and reported **`All checks completed, 0 errors`** in
+~2.6 s.
 
-The honest limits of that 4-entry number: an installed (precompiled) engine contributes no compile
-actions, so the database covers the project's own translation units, not `Engine/Source`. Engine
-files still work under clangd because the project's `.clangd` supplies the include paths — exactly
-what Epic's Unreal-clangd VS Code extension does (its generated `Lp.0.rsp` contains only `/FI`
-plus 523 `/I` lines, and `compile_commands.json` there has 6 project entries and no engine entry).
+The honest limits of that number: an installed (precompiled) engine contributes no compile actions,
+so the database covers the project's own translation units, not `Engine/Source`. Engine files still
+work under clangd because the project's `.clangd` supplies the include paths — exactly what Epic's
+Unreal-clangd VS Code extension does (its generated `Lp.0.rsp` contains only `/FI` plus 523 `/I`
+lines, and `compile_commands.json` there has 6 project entries and no engine entry).
 Re-run with `refresh: true` after changing `Build.cs` files, adding modules, or switching engine
 version.
+
+### Where the database must land (`installTo`)
+
+Writing a database the session never reads is not an improvement. `ensureCompileDb` puts its output
+in `$PI_UNREAL_CACHE_DIR/compiledb/<target>.<platform>.<config>/`; the database the clangd MCP on
+this box reads is `<project>/.vscode/unreal-clangd/compile_commands.json`, written by Epic's
+Unreal-clangd VS Code extension with `-OutputDir=<project>/.vscode/unreal-clangd` (measured: 999-byte
+jsonc file, 5 entries, `--compile-commands-dir=<project>/.vscode/unreal-clangd`, `compilationDatabase
+Exists true`, 2,693 files in its background index, clangd 22.1.3). `compiledb installTo:
+"<project>/.vscode/unreal-clangd"` copies the normalized database there and prints the exact lines to
+merge:
+
+```text
+CompileFlags:
+  CompilationDatabase: C:/Users/…/Lp/.vscode/unreal-clangd
+```
+
+pi-unreal **never writes `.clangd`**: the file carries the developer's flag removals (`/Yu* /Fm* /FI*
+/Fp*`) and clang-cl forcing, and the Unreal-clangd extension owns `.vscode/settings.json`. The
+answer prints the snippet and leaves the merge to the developer.
+
+### clangd health (`unreal_index` action `clangd`)
+
+The compiler-free probe for "is the clangd on this box usable?", because the MCP payload cannot
+answer it. `get_diagnostics` returned `published: 0` with all-zero counts for
+`Source/Lp/Private/Lp.cpp` — a file that HAS a compile command in the database — and for a file with
+no command: identical payloads. `published: 0` does not distinguish "looked, found nothing" from
+"never looked". The probe prints what is observable:
+
+| Line | Field meaning |
+| --- | --- |
+| `clangd searches: <dirs>` | the `CompilationDatabase:` setting parsed from `.clangd`, plus Epic's `.vscode/unreal-clangd` and the Intermediate UBT directories |
+| `live database <path>: N entries, covers X/Y translation units of the project scope on disk` | entries measured against the TU set the scope generates — the "is clangd blind?" line |
+| `N current TU(s) have NO compile command: LpMoverPawn.cpp [Lp], …` | the root cause of a diagnostics answer that is empty for a real file |
+| `N entries name a file that no longer exists on disk (…DeletedPawn.cpp)` | why `find_references` reports ghost hits — on this box the database was written 2026-10-19, the sources were reorganized 2026-10-21, and clangd's warm `.idx` is newest 2026-10-20 |
+| `diagnosis: compileCommands_Lp.0.rsp (0.0 days, 523 lines) are NEWER than the compile database (9.x days): the include paths are current, the file list is not` | separates "include paths are fine" from "file list is stale" — the measured 5-of-7 / 4-deleted state, so "3 of 6" is corrected by measurement, not quoted |
+| `file <x>: compile command in the database clangd reads → found\|none` | the per-file gate, for the comparison experiment |
+| `publishObserved: published:0 cannot distinguish …` | the honesty line: pi-unreal cannot observe what the MCP published |
+| `no link check: a clean clangd --check proves this file parses with these flags … UnrealEngine-BuildProjectEditor is the link check` | the AGENTS.md pointer |
+
+Measured on this box: **3 of 7** project translation units had a compile command in the database
+clangd reads; the 9-entry regeneration covers the current set. `unreal_index action "status"` prints
+the same coverage line cheaply (the probe is the file-level detail).
+
+## Cache reclaim (`unreal_index` action `prune`) and bounded call sites (`callsites`)
+
+Cache growth was the 2026-10-28 finding: 481 MB in `~/.pi/agent/unreal-cache`, 177 MB of it (37 %)
+unreachable. `status` now reports an `index cache: N MB live, M MB reclaimable (K entry(ies))` line,
+labels every reclaimable entry with a reason (`superseded (… roots)`, `keyed by its root set`, `format
+v4/v5, current v6`, `root no longer present: <path>`), prints the root set current lookups ask for
+(`current root set — engine: 279 engine-source root(s); project: 1 project root(s), 25 engine-plugin
+root(s)`) and names orphaned keys with the key the next lookup computes. `prune` deletes exactly the
+entries `status` marks reclaimable — index and header directories only, never `query/`, `compiledb/`
+or the plugin cache, and `prune compileDb: true` is required to touch those. Measured: 177 MB returned
+from the five dead entries; the audit is idempotent (a second `prune` finds nothing).
+
+`callsites` is the deliberate exception to "declarations only", and it is bounded and labelled. The
+field session needed `ALpMoverPawn::ProduceInput` callers; the compile database has no engine TUs and
+the clangd index is stale, so `find_implementations` returned 2 rows, 4 engine-header overrides, and
+zero `Lp` implementers. `callsites` reads text **only** in the scope the question is about: a module's
+`.cpp` tree (`Source/<Module>/Private` for a project module, `engineAreas:
+["Plugins/Animation/Mover"]` for a plugin, `scope: "all"` for the project ∪ plugin roots it enables),
+suffix-matching the owner (so `"ProduceInput"` matches `IMoverInputProducerInterface.h`, not a
+`ProduceInput_Implementation` method in an unrelated plugin), with a per-file cap and a hard module
+list — never a whole-engine grep. Its rows are `candidate` lines (declaration / implementer
+declaration / definition / token mention), each with `match` + `via` naming the kind, and
+`isCallEdge: false`: a text match is not a call edge, and `FindTestVisibilityComponent`-style
+false positives are expected and labelled. clangd `find_call_hierarchy` remains the authority the
+moment a current compile database exists.
 
 ## How engine resolution works
 
