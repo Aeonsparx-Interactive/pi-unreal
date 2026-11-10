@@ -231,7 +231,7 @@ describe("the answer a 0-row lookup owes the caller", () => {
 
 	it("for a project scope says engine sources were never scanned", () => {
 		const notes = zeroResultNotes({ query: "AActor", scope: "project", workspace, coverage: [{ key: "idx-p", scope: "project", kinds: "1 project root(s)", areas: [], roots: 1 }], indexes: [] });
-		expect(notes.join("\n")).toContain("engine sources are not scanned");
+		expect(notes.join("\n")).toContain("does not scan engine sources");
 	});
 
 	it("suggests real FILE names from the index and labels them as files", async () => {

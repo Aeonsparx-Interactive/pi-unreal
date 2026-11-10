@@ -31,13 +31,18 @@ refuses to pick, so neither should the agent. Pass `engineRootHint` to disambigu
 
 ## Machine-local facts that are not inferable
 
-- `HKLM` registers UE 4.0 … 5.7. **UE 5.8 has no registry key**: it is found by scanning
-  `C:/Program Files/Epic Games` for `UE_*`, or by `$env:UNREAL_ENGINE`, which points at it.
-- 5.5 and 5.6 registry entries point at directories that do not exist. A registry hit is a
-  **candidate**, never a conclusion — every candidate is validated
-  (`Engine/Binaries` + `Engine/Build` + `Engine/Build/Build.version` major.minor match)
-  before it can be reported.
-- `D:/UnrealEngine/Source` is a source build (5.7.4) registered under a GUID in `HKCU`.
+- `HKLM` registers the installed UE versions it has entries for — in UE 5.x that meant 4.0 … 5.7, and
+  **a new minor version can ship with no registry key at all** (5.8 has none on the box this was
+  written on). Do not conclude "no engine" from an empty registry: resolve through `$env:UNREAL_ENGINE`,
+  the Launcher's install list, and a scan of the install directory (`C:/Program Files/Epic Games` by
+  default) for `UE_*` directories.
+- Registry entries can be **stale**: a key may point at a directory that no longer exists (5.5 and 5.6
+  entries did on the same box). A registry hit is a **candidate**, never a conclusion — every
+  candidate is validated (`Engine/Binaries` + `Engine/Build` + `Engine/Build/Build.version`
+  major.minor match) before it can be reported.
+- Source builds live wherever the user put them and are registered under a GUID in
+  `HKCU:\SOFTWARE\Epic Games\Unreal Engine\Builds`; an unregistered source tree is still usable via
+  an explicit engine-root path. Never assume a canonical clone location.
 
 ## Descriptor fields: read them from the parser, not from memory
 

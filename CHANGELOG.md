@@ -10,6 +10,77 @@ a renamed parameter, or answer text an existing consumer parses.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-10
+
+A correctness release driven by a review of the package against its own published claims: every
+number in the docs, every row the scanner emits, and every cached answer was checked against the
+live cache on the reporting box (UE 5.8.3 installed engine, Lp project with 28 plugin references).
+
+The headline defect was the cached index. Key equality says *what* was scanned, never whether it
+still matches the tree, so after any edit the index kept answering with yesterday's line numbers
+and silently hid new symbols — the one failure mode where file and symbol look right and only the
+line is wrong. A reused index is now verified (per-file mtimes) and repaired (patch) before it is
+trusted.
+
+### Added
+
+- **Freshness gate on every reused index** — `files.tsv` carries a per-file `mtimeMs` (index format
+  v7), `meta.json` carries `rootsState` and `freshness.newestMtimeMs`, and `ensureIndex` stats the
+  indexed files before answering (~250 ms for the 18.5 k-file engine index, memoized 10 s). Edited
+  and deleted files are re-scanned and patched automatically up to 200 files (measured: 150 ms for
+  one edited `.cpp`), with one line reporting both the finding and the repair. Past the limit, or
+  when only the scan *roots* moved, the answer warns and asks for `refresh: true`; an index from an
+  older format says freshness cannot be checked instead of pretending. (`lib/store.ts`
+  `indexFreshness`, `freshnessNote`, `patchIndex`, `restampFileRows`, `markIndexUsed`,
+  `lib/tools.ts` `keepCurrent`, `AUTO_PATCH_LIMIT`.)
+- `unreal_index` `action: "patch"` — the explicit form: no `files` patches whatever the freshness
+  diff finds, an explicit `files` list patches exactly those.
+- `unreal_index` `action: "status"` reports `last used <age>` and `freshness: N edited / M deleted
+  of K checked` per index, and `action: "prune"` gained `olderThanDays` — reachability alone kept an
+  index forever (135 MB of this box's cache was an index nothing had asked for in 12 days), so reuse
+  writes a `.used` marker and an unused healthy index is now reclaimable on request.
+- Symbol rows carry the declaration's own text (`snippet`), so a lookup usually answers "what does
+  it look like" without a follow-up read. The snippet cache is keyed by mtime, not by path.
+- The project index now defaults to UnrealBuildTool Query module attribution when a Query cache
+  exists (`dirToModule`), instead of always using the `*.Build.cs` heuristic.
+
+### Fixed
+
+- **Destructors were never indexed** (0 rows in the whole engine index): the scanner rejected any
+  head containing `~`. 1,959 engine rows and 148 project rows appear now.
+- **Local declarations in `.cpp` files were indexed as functions** — 18,470 of 37,562 unqualified
+  source rows, e.g. `FScopeLock Lock(&CriticalSection);` recorded as a function named `Lock`. A
+  source-file signature now requires `Owner::Name` unless it sits inside a type body.
+- `pure virtual` was appended twice per qualified row (`decl pure virtual pure virtual`, 5,239
+  rows). Engine index: 437,614 → 420,603 symbols, project: 50,440 → 48,645 after both scanner fixes.
+- 0-row engine answers did not mention that plugin roots are referenced-only and that the project
+  index never scans engine sources; the gap now prints on every path, naming the scope asked for.
+- `*.Build.cs` module lookup walked ~100 k directory listings per engine build (uncached
+  `readdirSync` per level, per file); it is memoized.
+- The `.uasset` edit gate silently did nothing off Windows (`tasklist` threw into a catch); it now
+  probes `UnrealEditor` with `pgrep` on POSIX.
+
+### Changed
+
+- Docs corrected against measurements instead of memory: `docs/internals.md` cost table (project
+  3,264 files / 48,645 symbols / 20.5 s; engine `Runtime` 18,566 / 420,603 / 112.8 s cold, 0.3-0.6 s
+  warm), ranking order (exact → prefix → qualified-member → substring, forward declarations +1), the
+  engine-scope "known limit" (project plugin roots belong to the project index), a new freshness
+  section, and the scanner-version note that counts move when the scanner changes.
+- `skills/ue-engine-resolution` no longer hard-codes one machine (a specific 5.7.4 engine source
+  path, "5.8 has no registry key" as a universal fact); the session context card lists every tool
+  and command and states which gate probe is active on this platform.
+- README states what the package is worth when clangd is already installed (engine-wide
+  declarations without a compile database, plus UBT module/include facts) instead of implying clangd
+  is absent.
+
+### Known limits
+
+- Blueprint is still the editor's job: the package indexes C++ declarations and reads `.uasset`/
+  `.umap` only as opaque files. `docs/internals.md` "Known limits" now says that outright, including
+  that "Blueprint awareness" here means only the C++ edge (`UFUNCTION`/`UPROPERTY` markers, asset
+  references in descriptors), not Blueprint graph or authoring conventions.
+
 ## [1.2.0] - 2026-10-29
 
 Closes the field findings in `tmp/reports/field-findings-2026-10-28.md` (same UE 5.8.3 installed

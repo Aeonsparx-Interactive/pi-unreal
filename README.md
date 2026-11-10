@@ -56,7 +56,17 @@ project?", "Where is `FLpMovementDirectionThresholds` defined?", "What do I need
 | `unreal_symbol` | "Where is this class / struct / function / `UPROPERTY` / delegate declared?" One line per hit: kind, file:line, module |
 | `unreal_symbol_list` | "What does this project define?" Names by prefix — `ULp`, `ANiMy`, `UAnim` |
 | `unreal_context` | "What does this file/module include, define, and depend on?" Include paths, dependency lists, the real `WITH_*` defines; for a module, also whether the target's module graph contains it and how the `.uproject` treats its plugin |
-| `unreal_index` | Builds and reports the source index, the path-only **header index** ("does this header exist in this engine version?"), the clangd compile database, a **clangd health probe**, and cache reclaim (`status` / `prune`) |
+| `unreal_index` | Builds and reports the source index, the path-only **header index** ("does this header exist in this engine version?"), the clangd compile database, a **clangd health probe**, targeted re-scans (`patch`), and cache reclaim (`status` / `prune`) |
+
+A lookup returns the declaration line's own text under each hit, so the usual follow-up (`read` at
+`file:line`) is only needed when the surrounding context matters.
+
+**What this buys you when clangd is already installed.** On a box with a working clangd and a live
+compile database, clangd stays the authority for references, overrides, call hierarchies and
+diagnostics. What it cannot answer is the engine-wide "where is this declared" question *without* a
+compile database for that translation unit — which is the normal state on an installed engine
+(engine modules are precompiled and contribute no compile actions). That, plus module/include/dependency
+facts from UnrealBuildTool Query, is the part of this package that stays useful in a clangd setup.
 
 **Slash commands you can type yourself:**
 
@@ -140,6 +150,7 @@ unreal_symbol 'PhysicsControlComponent' scope=engine: 0 definition(s)
 | Operation | Time |
 | --- | --- |
 | Cached lookup (symbol, project facts) | ~0.3 s |
+| Reused index, files edited since the build | +~0.15 s per file (patched before the answer, up to 200 files) |
 | First project/plugin index (≈2,400 files) | seconds |
 | Engine `Runtime` index — cold | ~1 minute |
 | Engine `Runtime` index — warm | ~6 s |
@@ -175,7 +186,9 @@ Because of that model:
   health probe: entries in the database clangd reads, how many translation units of its scope they
   cover, which current sources have no compile command, and which entries name deleted files.
 - After a branch switch, a rebase, adding a plugin, or an engine version change, say "rebuild the
-  Unreal index" (that is `refresh: true`).
+  Unreal index" (that is `refresh: true`). A single edited file needs no rebuild: the index stores a
+  per-file mtime, so a lookup notices the edit and re-scans just that file before answering (say so
+  with `unreal_index` → `action: "patch"`, which also takes an explicit list of `files`).
 - Everything lives in `~/.pi/agent/unreal-cache` (override with `$PI_UNREAL_CACHE_DIR`) — never
   inside your project tree or your engine installation. The compile database encodes this
   machine's absolute paths, so it is machine-local by design.

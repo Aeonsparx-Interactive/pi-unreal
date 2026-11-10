@@ -5,18 +5,24 @@
  * project tree, which is 1.5 GB, and not git):
  *
  *   meta.json      build metadata: roots, mode, source (ubt|heuristic), counts, warnings, engine and
- *                  target identity, paths to the UnrealBuildTool Query JSON it was built from
+ *                  target identity, paths to the UnrealBuildTool Query JSON it was built from, and the
+ *                  scan-root mtimes + newest-file mtime that make staleness answerable
  *   defs.tsv       symbol \t kind \t file \t line \t module \t scope \t marker — sorted by
  *                  lowercased symbol, so exact lookup is a binary search over byte ranges
  *   includes.tsv   file \t module \t includes \t symbols — per-file `#include` set and declared
  *                  symbols, the base of the compile unit in `unreal_context` (full indexes)
- *   files.tsv      file \t module \t kind \t symbols — file inventory (module filter, file listing)
+ *   files.tsv      file \t module \t kind \t symbols \t mtimeMs — file inventory (module filter,
+ *                  file listing, and the per-file mtime `indexFreshness` stats)
  *
  * Text, not SQLite: this box has no build toolchain for native modules, bun is an optional runtime,
  * and a TSV is inspectable with `rg`. Two facts make that cheap enough at engine scale:
- *   - 696,237 definitions (Lp + 5.8 engine) produce a 69 MB defs.tsv in 17 s;
+ *   - one Runtime-area engine index (Engine/Source/Runtime on UE 5.8) is 18,566 files / 437,614 rows
+ *     and a 73 MB defs.tsv, built in under a minute on this box;
  *   - a sorted TSV answers exact and prefix lookup by binary search over byte ranges, which is what
  *     agents actually ask for (clangd is the tool for position-sensitive questions, not this one).
+ *
+ * Counts are never written here by hand: `unreal_index` action "status" reports them from the live
+ * meta.json, and the copies in this file are the ones that went stale.
  *
  * Every query takes an explicit `IndexState` and the tools echo `index: {key, mode, source, roots}`
  * on every result, because a workspace can hold several indexes (definitions for the engine, full
@@ -32,23 +38,26 @@ import { collectSourceFiles, scanText, type IncludeRef, type ScanRoot, type Symb
 import { parseModuleReferences, parseTargetDetails, readQueryJson, type UbtModuleRefs, type UbtModuleSettings } from "./ubt.ts";
 
 /**
- * v6: `meta.rootKinds` (what an index actually covers, by root kind) and `meta.areas`, and engine-scope
- * indexes now include the project's enabled plugin roots, so engine-scope keys change and v5 engine
- * indexes are not reused. v5 was the TSV layout change; older indexes are unreadable by design.
+ * v7: files.tsv carries a per-file mtime and meta carries `rootsState`/`freshness`, so a cached index
+ * can answer "has the tree moved since I scanned it" (see `indexFreshness`) instead of being reused
+ * blindly. v6 was `meta.rootKinds`/`meta.areas` (which also moved engine scope off the project's
+ * plugin roots). v5 was the TSV layout change; older indexes are unreadable by design.
  */
-export const INDEX_VERSION = 6;
+export const INDEX_VERSION = 7;
 
 /**
  * Default engine scan. `Runtime` is where the **engine's own** gameplay types live (AActor,
- * UAnimInstance, UGameModeBase): measured 6,212 files / 126,350 definitions in 34 s on a UE 5.8
- * install. `Editor` and `Developer` roughly triple that, so they are opt-in through `engineAreas`.
+ * UAnimInstance, UGameModeBase). `Editor` and `Developer` roughly triple the file count, so they are
+ * opt-in through `engineAreas`. Compare against a live index with `unreal_index` action "status"
+ * rather than with a number in this comment.
  *
  * It is NOT the whole engine: most UE-facing types shipped as engine *plugins* (Mover, PoseSearch,
  * PhysicsControl, BlendStack, SmartObjects, StateTree, GameplayAbilities, GameplayStateTree, …) live
- * under Engine/Plugins/<category>/<plugin>/Source/<module>, which `"Runtime"` does not touch. Engine-scope
- * indexes therefore add the plugin roots the project enables (free — already computed), and
- * `engineAreas: ["Plugins"]` (or `["Plugins/Animation/PhysicsControl"]`) dials in the rest. Measured on
- * UE 5.8: Engine/Source/Runtime is 18,681 scannable files, all plugin sources are 52,568 (~2.8x).
+ * under Engine/Plugins/<category>/<plugin>/Source/<module>, which `"Runtime"` does not touch. Two
+ * dials cover that: the project index always scans the plugin roots the `.uproject` enables (free —
+ * already computed), and `engineAreas: ["Plugins"]` (or `["Plugins/Animation/PhysicsControl"]`)
+ * puts engine plugin sources into the engine index. A `scope: "engine"` / `"all"` answer is the
+ * union of the two indexes, not a single scan.
  */
 export const DEFAULT_ENGINE_AREAS = ["Runtime"];
 
@@ -78,6 +87,10 @@ export interface IndexMeta {
 	rootKinds?: Record<string, number>;
 	/** `engineAreas` the engine half was scanned with, when an engine half exists. */
 	areas?: string[];
+	/** Directory mtime of every scan root at build time: cheap add/remove detection (`indexFreshness`). */
+	rootsState?: { dir: string; mtimeMs: number }[];
+	/** `files` = files that recorded an mtime; `newestMtimeMs` = the newest of them. */
+	freshness?: { files: number; newestMtimeMs: number };
 	warnings: string[];
 	sizeBytes: number;
 	defsPath: string;
@@ -191,6 +204,46 @@ export function deriveScope(roots: string[], options: { projectRoot?: string; en
 export interface LookupResult extends DefRow {
 	/** 0 = exact, 1 = prefix, 2 = qualified-member fallback. */
 	rank: number;
+	/** The indexed line's source text (trimmed, truncated): the answer without a follow-up `read`. */
+	snippet?: string;
+}
+
+const sourceLineCache = new Map<string, { mtimeMs: number; lines: string[] }>();
+const SOURCE_LINE_CACHE_MAX = 300;
+const SOURCE_LINE_FILE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * The source text of one indexed line, trimmed.
+ *
+ * A row is a citation (`file:line`), and an agent that has to open the file to learn what the line says
+ * pays a whole extra turn for it. Reading one file per lookup (cached, size-capped, trimmed, truncated)
+ * is the cheapest way to answer "but what does it look like" in the same call.
+ */
+export function lineText(file: string, line: number): string | undefined {
+	// Keyed by content, not by path: the stat is re-read every call and an entry whose mtime moved is
+	// dropped. A path-keyed cache served the *old* text of a file that had just been edited — the exact
+	// confusion (`file:line` pointing at a different line than the one quoted) this line exists to prevent.
+	let mtimeMs: number;
+	try {
+		const stat = statSync(file);
+		if (stat.size > SOURCE_LINE_FILE_MAX_BYTES) return undefined;
+		mtimeMs = stat.mtimeMs;
+	} catch {
+		return undefined;
+	}
+	let entry = sourceLineCache.get(file);
+	if (!entry || entry.mtimeMs !== mtimeMs) {
+		try {
+			entry = { mtimeMs, lines: readFileSync(file, "utf8").split("\n") };
+		} catch {
+			return undefined;
+		}
+		if (sourceLineCache.size >= SOURCE_LINE_CACHE_MAX) sourceLineCache.clear();
+		sourceLineCache.set(file, entry);
+	}
+	const text = (entry.lines[line - 1] ?? "").trim();
+	if (!text) return undefined;
+	return text.length > 220 ? `${text.slice(0, 217)}...` : text;
 }
 
 const TSV_HEADER = ["symbol", "kind", "file", "line", "module", "scope", "marker"];
@@ -386,11 +439,13 @@ export async function buildIndex(input: {
 		batch = [];
 	};
 	const filesOut = new TsvStreamWriter(joinPath(dir, "files.tsv"));
-	filesOut.write("file\tmodule\tkind\tsymbols");
+	filesOut.write("file\tmodule\tkind\tsymbols\tmtimeMs");
 	const includesOut = input.mode === "full" ? new TsvStreamWriter(joinPath(dir, "includes.tsv")) : undefined;
 	includesOut?.write("file\tmodule\tincludes\tsymbols");
 	let fileTotal = 0;
 	let includeTotal = 0;
+	let newestFileMtime = 0;
+	let mtimeRows = 0;
 	const modules = new Set<string>();
 	const defsByKind: Record<string, number> = {};
 
@@ -410,7 +465,19 @@ export async function buildIndex(input: {
 		}
 		if (batch.length >= shardRows) flushBatch();
 		fileTotal++;
-		filesOut.write(`${esc(entry.abs)}\t${esc(module)}\t${fileKindLabel(entry.abs)}\t${defs.length}`);
+		// The mtime is what makes `indexFreshness` possible: a lookup can ask "did any indexed file
+		// change since this scan" without re-walking the tree or diffing content.
+		let mtimeMs = 0;
+		try {
+			mtimeMs = statSync(entry.abs).mtimeMs;
+		} catch {
+			/* deleted between the walk and the read: leave the row, freshness reports it missing */
+		}
+		if (mtimeMs > 0) {
+			mtimeRows++;
+			if (mtimeMs > newestFileMtime) newestFileMtime = mtimeMs;
+		}
+		filesOut.write(`${esc(entry.abs)}\t${esc(module)}\t${fileKindLabel(entry.abs)}\t${defs.length}\t${mtimeMs.toFixed(0)}`);
 		if (includesOut) {
 			includeTotal++;
 			includesOut.write(`${esc(entry.abs)}\t${esc(module)}\t${includes.map((inc) => (inc.angled ? `<${inc.target}>` : `"${inc.target}"`)).join(",")}\t${defs.map((def) => def.symbol).join(",")}`);
@@ -425,6 +492,15 @@ export async function buildIndex(input: {
 	await mergeSortedShards(shardPaths, defsOut);
 	defsOut.close();
 	rmSync(shardDir, { recursive: true, force: true });
+
+	const rootStates = input.roots.map((root) => {
+		const dir = normalizePath(root.dir);
+		try {
+			return { dir, mtimeMs: statSync(dir).mtimeMs };
+		} catch {
+			return { dir, mtimeMs: 0 };
+		}
+	});
 
 	const meta: IndexMeta = {
 		version: INDEX_VERSION,
@@ -445,6 +521,8 @@ export async function buildIndex(input: {
 		defsByKind,
 		rootKinds,
 		areas: input.areas,
+		rootsState: rootStates,
+		freshness: { files: mtimeRows, newestMtimeMs: newestFileMtime },
 		warnings,
 		sizeBytes: defsOut.bytes,
 		defsPath: normalizePath(joinPath(dir, "defs.tsv")),
@@ -466,7 +544,11 @@ export async function buildIndex(input: {
  * engine-area indexes; do not run it against a whole-`Engine/Plugins` index (~1.24 M rows, ~300 MB),
  * which is why no tool exposes it.
  */
-export async function patchIndex(index: IndexState, files: string[], resolveModule: (file: string) => { module: string; scope: IndexScope }): Promise<{ updated: number; added: number; removed: number }> {
+export async function patchIndex(
+	index: IndexState,
+	files: string[],
+	resolveModule: (file: string) => { module: string; scope: IndexScope },
+): Promise<{ updated: number; added: number; removed: number; deleted: number }> {
 	const rows = readDefRows(index);
 	const byFile = new Map<string, DefRow[]>();
 	for (const row of rows) {
@@ -477,26 +559,100 @@ export async function patchIndex(index: IndexState, files: string[], resolveModu
 	let updated = 0;
 	let added = 0;
 	let removed = 0;
+	let deleted = 0;
+	/** Per patched file: what files.tsv must say afterwards, if the file is in the inventory at all. */
+	const stamped = new Map<string, { module: string; scope: IndexScope; symbols: number; mtimeMs: number }>();
 	for (const file of files.map(normalizePath)) {
 		const existing = byFile.get(file);
 		if (!existing) added++;
 		else removed += existing.length;
 		let text: string;
+		let mtimeMs = 0;
 		try {
 			text = readFileSync(file, "utf8");
-		} catch {
+			mtimeMs = statSync(file).mtimeMs;
+		} catch (error) {
+			// Gone from disk: its rows must go too, or the index keeps citing a file that no longer
+			// exists. Any other read failure (lock, permissions) leaves the rows alone.
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				const { module, scope } = resolveModule(file);
+				byFile.set(file, []);
+				stamped.set(file, { module, scope, symbols: 0, mtimeMs: 0 });
+				deleted++;
+			}
 			continue;
 		}
 		const { module, scope } = resolveModule(file);
 		const { defs } = scanText(text, file, module, scope);
 		byFile.set(file, defs.map((def) => ({ symbol: def.symbol, kind: def.kind, file: def.file, line: def.line, module: def.module, scope: def.scope, marker: def.marker })));
+		stamped.set(file, { module, scope, symbols: defs.length, mtimeMs });
 		updated++;
 	}
 	const merged = [...byFile.values()].flat();
 	merged.sort(byProbe);
 	writeTextAtomic(index.meta.defsPath, `${TSV_HEADER.join("\t")}\n${merged.map((r) => [esc(r.symbol), r.kind, esc(r.file), r.line, esc(r.module), esc(r.scope), esc(r.marker)].join("\t")).join("\n")}\n`);
 	lineIndexCache.delete(index.meta.defsPath);
-	return { updated, added, removed };
+	if (stamped.size) restampFileRows(index, stamped);
+	try {
+		index.meta.counts = { ...index.meta.counts, symbols: merged.length, files: (index.meta.counts?.files ?? 0) - deleted };
+		writeJsonAtomic(joinPath(index.dir, "meta.json"), index.meta);
+	} catch {
+		/* meta is advisory */
+	}
+	freshnessCache.delete(index.dir);
+	return { updated, added, removed, deleted };
+}
+
+/**
+ * Rewrite the `files.tsv` rows a patch touched, then the meta that summarizes them.
+ *
+ * Without this a patched index re-reports the same files as stale forever: `indexFreshness` compares
+ * the mtime recorded in the inventory against the one on disk, so the inventory has to move with the
+ * definitions.
+ */
+function restampFileRows(index: IndexState, stamped: Map<string, { module: string; scope: IndexScope; symbols: number; mtimeMs: number }>): void {
+	let text: string;
+	try {
+		text = readFileSync(index.meta.filesPath, "utf8");
+	} catch {
+		return;
+	}
+	const lines = text.split("\n");
+	const header = lines[0] || "file\tmodule\tkind\tsymbols\tmtimeMs";
+	const kept: string[] = [header];
+	let newest = index.meta.freshness?.newestMtimeMs ?? 0;
+	const seen = new Set<string>();
+	for (let i = 1; i < lines.length; i++) {
+		const line = lines[i];
+		if (!line) continue;
+		const cells = line.split("\t");
+		const file = unesc(cells[0] ?? "");
+		const patch = stamped.get(file);
+		if (!patch) {
+			kept.push(line);
+			continue;
+		}
+		seen.add(file);
+		// mtimeMs 0 means "gone from disk": drop the inventory row, so freshness stops checking it.
+		if (patch.mtimeMs <= 0) continue;
+		if (patch.mtimeMs > newest) newest = patch.mtimeMs;
+		kept.push([esc(file), esc(patch.module), fileKindLabel(file), patch.symbols, patch.mtimeMs.toFixed(0)].join("\t"));
+	}
+	// A patched file that was not in the inventory (newly added source) gets a row, so the next
+	// freshness check stats it like every other indexed file.
+	for (const [file, patch] of stamped) {
+		if (seen.has(file) || patch.mtimeMs <= 0) continue;
+		if (patch.mtimeMs > newest) newest = patch.mtimeMs;
+		kept.push([esc(file), esc(patch.module), fileKindLabel(file), patch.symbols, patch.mtimeMs.toFixed(0)].join("\t"));
+	}
+	writeTextAtomic(index.meta.filesPath, `${kept.join("\n")}\n`);
+	try {
+		const total = kept.length - 1;
+		index.meta.freshness = { files: total > 0 ? total : 0, newestMtimeMs: newest };
+		writeJsonAtomic(joinPath(index.dir, "meta.json"), index.meta);
+	} catch {
+		/* meta is advisory: a failed rewrite must not fail the patch itself */
+	}
 }
 
 /* ──────────────────────────────────────────────────────────────────────── lookup */
@@ -624,8 +780,104 @@ function forEachDefRow(index: IndexState, onRow: (row: DefRow) => boolean | void
 	});
 }
 
-function readFileRows(index: IndexState): { file: string; module: string; kind: string; symbols: number }[] {
-	return readTsv(readFileSync(index.meta.filesPath, "utf8"), 3) as unknown as { file: string; module: string; kind: string; symbols: number }[];
+function readFileRows(index: IndexState): { file: string; module: string; kind: string; symbols: number; mtimeMs: number }[] {
+	return readTsv(readFileSync(index.meta.filesPath, "utf8"), 3) as unknown as { file: string; module: string; kind: string; symbols: number; mtimeMs: number }[];
+}
+
+/* ─────────────────────────────────────────────────────────────── freshness */
+
+/** What changed under an index since it was built. `indexFreshness` answers it from files.tsv. */
+export interface IndexFreshness {
+	checked: number;
+	/** Indexed files that no longer exist. */
+	missing: string[];
+	/** Indexed files whose mtime moved (edited, touched by a branch switch, replaced). */
+	changed: string[];
+	newestOnDiskMs: number;
+	newestAtBuildMs: number;
+	/** Scan roots whose directory mtime moved (a module or file added/removed at that level). */
+	movedRoots: string[];
+	/** False for a pre-v7 index, where per-file mtimes were never recorded: the answer is "unknown". */
+	supported: boolean;
+	/** Set when the file list exceeded `maxFiles`, so only the first `maxFiles` rows were compared. */
+	truncated: boolean;
+	checkedAt: number;
+}
+
+const freshnessCache = new Map<string, { at: number; result: IndexFreshness }>();
+/** A lookup re-checks an index at most this often: the answer is about the tree, not about this call. */
+export const FRESHNESS_TTL_MS = 10_000;
+
+export function clearFreshnessCache(): void {
+	freshnessCache.clear();
+}
+
+/**
+ * "Is this cached index still describing the tree?"
+ *
+ * A key match says the index is *reachable*, not that it is *current*: `indexKeyFor` fingerprints roots
+ * and engine identity, so editing `LpCharacter.cpp` leaves the key identical while every later line
+ * number in that file is off and any new symbol is absent. The mtimes files.tsv records make that
+ * answerable with one `stat` per indexed file (project scope: a few thousand stats, tens of ms), which
+ * is why v7 records them. Result is memoized for `FRESHNESS_TTL_MS` per index directory.
+ */
+export function indexFreshness(index: IndexState, options: { maxFiles?: number; ttlMs?: number } = {}): IndexFreshness {
+	const ttl = options.ttlMs ?? FRESHNESS_TTL_MS;
+	const cached = freshnessCache.get(index.dir);
+	if (cached && Date.now() - cached.at < ttl) return cached.result;
+
+	const empty: IndexFreshness = { checked: 0, missing: [], changed: [], newestOnDiskMs: 0, newestAtBuildMs: index.meta.freshness?.newestMtimeMs ?? 0, movedRoots: [], supported: false, truncated: false, checkedAt: Date.now() };
+	const result: IndexFreshness = { ...empty };
+	let rows: ReturnType<typeof readFileRows> = [];
+	try {
+		rows = readFileRows(index);
+	} catch {
+		freshnessCache.set(index.dir, { at: Date.now(), result });
+		return result;
+	}
+	result.supported = rows.some((row) => Number(row.mtimeMs) > 0);
+	const maxFiles = options.maxFiles ?? Number.POSITIVE_INFINITY;
+
+	for (const row of rows) {
+		if (result.checked >= maxFiles) {
+			result.truncated = true;
+			break;
+		}
+		result.checked++;
+		let current: ReturnType<typeof statSync> | undefined;
+		try {
+			current = statSync(row.file);
+		} catch {
+			result.missing.push(row.file);
+			continue;
+		}
+		if (current.mtimeMs > result.newestOnDiskMs) result.newestOnDiskMs = current.mtimeMs;
+		const recorded = Number(row.mtimeMs) || 0;
+		if (result.supported && Math.abs(current.mtimeMs - recorded) > 1) result.changed.push(row.file);
+	}
+
+	for (const root of index.meta.rootsState ?? []) {
+		try {
+			if (statSync(root.dir).mtimeMs !== root.mtimeMs) result.movedRoots.push(root.dir);
+		} catch {
+			result.movedRoots.push(root.dir);
+		}
+	}
+	result.checkedAt = Date.now();
+	freshnessCache.set(index.dir, { at: result.checkedAt, result });
+	return result;
+}
+
+/** One line a lookup can print before trusting an index; empty when the index is current or unknown. */
+export function freshnessNote(index: IndexState, freshness: IndexFreshness): string | undefined {
+	if (!freshness.supported) return `index ${index.key} predates per-file mtimes (format v${index.meta.version}), so freshness cannot be checked: rebuild with unreal_index action build refresh true`;
+	const stale = freshness.changed.length + freshness.missing.length;
+	if (!stale && !freshness.movedRoots.length) return undefined;
+	const parts: string[] = [];
+	if (freshness.changed.length) parts.push(`${freshness.changed.length} edited`);
+	if (freshness.missing.length) parts.push(`${freshness.missing.length} deleted`);
+	if (freshness.movedRoots.length) parts.push(`${freshness.movedRoots.length} root(s) changed`);
+	return `index ${index.key} is stale: ${parts.join(", ")} since it was built (${freshness.checked} files checked) — line numbers in those files are wrong and new symbols are absent`;
 }
 
 /** Binary search the sorted defs for the first row whose symbol is >= needle (lowercased, colon-free). */
@@ -739,7 +991,10 @@ export function lookupSymbol(index: IndexState, query: string, options: { limit?
 			return out.length < limit;
 		});
 	}
-	return out.sort((a, b) => a.rank - b.rank || a.scope.localeCompare(b.scope) || a.symbol.localeCompare(b.symbol)).slice(0, limit);
+	return out.sort((a, b) => a.rank - b.rank || a.scope.localeCompare(b.scope) || a.symbol.localeCompare(b.symbol)).slice(0, limit).map((row) => {
+		const snippet = lineText(row.file, row.line);
+		return snippet ? { ...row, snippet } : row;
+	});
 }
 
 /**
@@ -1585,16 +1840,36 @@ export function moduleFromSourcePath(file: string): string | undefined {
 	return marker >= 0 ? parts[marker + 1] : undefined;
 }
 
-/** Module names owned by `dir`: basenames of its `*.Build.cs` files (empty when it owns none). */
+/**
+ * Module names owned by `dir`: basenames of its `*.Build.cs` files (empty when it owns none).
+ *
+ * Memoized because `moduleFromBuildCs` probes every ancestor directory of a file (up to eight), so an
+ * engine build called `readdirSync` tens of thousands of times on the same handful of directories.
+ * The cache is per-process and bounded: a `Build.cs` added mid-session is picked up by the next build
+ * or `unreal_index action "build" refresh true`, not by a running scan.
+ */
+const buildCsCache = new Map<string, string[]>();
+const BUILD_CS_CACHE_MAX = 20_000;
+
 export function buildCsNames(dir: string): string[] {
 	const here = normalizePath(dir);
+	const cached = buildCsCache.get(here);
+	if (cached) return cached;
 	let names: string[];
 	try {
 		names = readdirSync(here);
 	} catch {
-		return [];
+		names = [];
 	}
-	return names.filter((entry) => entry.endsWith(".Build.cs")).map((entry) => entry.slice(0, -".Build.cs".length));
+	const buildCs = names.filter((entry) => entry.endsWith(".Build.cs")).map((entry) => entry.slice(0, -".Build.cs".length));
+	if (buildCsCache.size >= BUILD_CS_CACHE_MAX) buildCsCache.clear();
+	buildCsCache.set(here, buildCs);
+	return buildCs;
+}
+
+/** Drop the `Build.cs` memo (tests, and after a scan that may have added modules). */
+export function clearBuildCsCache(): void {
+	buildCsCache.clear();
 }
 
 /** Choose the module name a directory's `*.Build.cs` files imply (see `moduleFromBuildCs`). */
@@ -1726,6 +2001,8 @@ export interface CacheAuditEntry {
 	ageMs: number;
 	/** Set when the entry can be deleted; the reason is printed verbatim. */
 	reclaimable?: string;
+	/** Last time a lookup selected this entry (the `.used` marker a hit writes), 0 when never. */
+	lastUsedMs?: number;
 	scope?: string;
 	mode?: string;
 	source?: string;
@@ -1768,6 +2045,48 @@ function directoryAgeMs(dir: string): number {
 		return Date.now() - statSync(dir).mtimeMs;
 	} catch {
 		return 0;
+	}
+}
+
+/** Age of a path's mtime, or `undefined` when it does not exist. */
+function fileAgeMs(path: string): number | undefined {
+	try {
+		return Date.now() - statSync(path).mtimeMs;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Does `dir` hold a `*.uproject`? A project index without one can never be selected again. */
+function hasUproject(dir: string): boolean {
+	try {
+		return readdirSync(dir).some((name) => name.toLowerCase().endsWith(".uproject"));
+	} catch {
+		return false;
+	}
+}
+
+/** Age of the last lookup that selected this index, falling back to its build time. */
+function lastUsedFor(state: IndexState): number {
+	const marked = fileAgeMs(joinPath(state.dir, USED_MARKER));
+	if (marked !== undefined) return marked;
+	const built = Date.parse(state.meta.generatedAt ?? "");
+	return Number.isFinite(built) ? Date.now() - built : state.ageMs;
+}
+
+/** Marker a cache hit touches, so `audit` can tell a live-but-unused index from a used one. */
+export const USED_MARKER = ".used";
+
+/**
+ * Record that a lookup selected this index. Called at most once per process per index by
+ * `ensureIndex`: the marker is an audit input, not a timer, so per-lookup writes would be enough to
+ * make `ageMs` meaningless without adding information.
+ */
+export function markIndexUsed(state: IndexState): void {
+	try {
+		writeFileSync(joinPath(state.dir, USED_MARKER), new Date().toISOString());
+	} catch {
+		/* read-only cache: the audit falls back to the build time */
 	}
 }
 
@@ -1840,6 +2159,11 @@ export function auditCache(): CacheAudit {
 		if (!meta.defsPath || !existsSync(meta.defsPath)) reasons.push("defs.tsv missing");
 		const deadRoot = (meta.roots ?? []).find((path) => !existsSync(path));
 		if (deadRoot) reasons.push(`root no longer present: ${deadRoot}`);
+		// A project index is selected by `workspace.projectDir`, which only exists when a `.uproject`
+		// was discovered there: without one this entry can never be picked again.
+		if (state.scope === "Project" && meta.projectRoot && !hasUproject(meta.projectRoot)) {
+			reasons.push(`no .uproject under its projectRoot (${meta.projectRoot}): no lookup can select it`);
+		}
 		const expectedKey = expectedKeyFor(state);
 		if (keyFingerprint(meta.key) !== keyFingerprint(expectedKey)) {
 			reasons.push(state.scope === "Engine" && isLegacyEngineIndexKey(meta.key, meta)
@@ -1847,7 +2171,7 @@ export function auditCache(): CacheAudit {
 				: `no lookup selects this entry: the current key rules compute ${expectedKey}`);
 		}
 		const counts = meta.counts ? `${meta.counts.symbols?.toLocaleString() ?? "?"} symbols / ${(meta.counts.files ?? 0).toLocaleString()} files` : "no counts";
-		entries.push({ kind: "index", key: state.key, dir: state.dir, bytes: directoryBytes(state.dir), ageMs: state.ageMs, reclaimable: reasons.join("; ") || undefined, scope: state.scope, mode: meta.mode, source: meta.source, counts });
+		entries.push({ kind: "index", key: state.key, dir: state.dir, bytes: directoryBytes(state.dir), ageMs: state.ageMs, reclaimable: reasons.join("; ") || undefined, lastUsedMs: lastUsedFor(state), scope: state.scope, mode: meta.mode, source: meta.source, counts });
 	}
 
 	const headerRoot = headersRoot();
@@ -1898,6 +2222,11 @@ export function auditCache(): CacheAudit {
 	const reclaimableBytes = entries.reduce((sum, entry) => sum + (entry.reclaimable ? entry.bytes : 0), 0);
 	const keptBytes = entries.reduce((sum, entry) => sum + (entry.reclaimable ? 0 : entry.bytes), 0);
 	notes.push(`cache ${root}: ${megabytes(reclaimableBytes + keptBytes)} total, ${megabytes(reclaimableBytes)} reclaimable (${entries.filter((entry) => entry.reclaimable).length} entries), ${megabytes(keptBytes)} live`);
+	const unused = entries.filter((entry) => entry.kind === "index" && !entry.reclaimable && entry.lastUsedMs !== undefined && entry.lastUsedMs > 30 * 86_400_000);
+	if (unused.length) {
+		const bytes = unused.reduce((sum, entry) => sum + entry.bytes, 0);
+		notes.push(`${unused.length} healthy index entr${unused.length === 1 ? "y" : "ies"} unused for more than 30 days (${megabytes(bytes)}): unreal_index action "prune" olderThanDays 30 deletes them; nothing does that by default because an engine rebuild costs minutes`);
+	}
 	notes.push("reclaimable entries are derived data: rebuild with unreal_index action \"build\" / \"headers\"; query/ and compiledb/ are never deleted without an explicit flag (Query costs ~12 s per target, GenerateClangDatabase costs minutes)");
 	return { cacheDir: root, entries: entries.sort((a, b) => b.bytes - a.bytes), reclaimableBytes, keptBytes, notes };
 }
@@ -1912,8 +2241,12 @@ export interface PruneResult {
 /**
  * Delete every entry `auditCache` marked reclaimable. Nothing healthy is ever removed, and
  * `query/`, `compiledb/` and the plugin-index cache are left alone.
+ *
+ * `olderThanDays` is the opt-in for "healthy but unused": the audit can only prove an entry is
+ * *reachable*, so deleting one that no lookup has selected in a month is a judgement call the caller
+ * has to make explicitly (an engine index is minutes to rebuild).
  */
-export function pruneCache(opts: { query?: boolean; compileDb?: boolean } = {}): PruneResult {
+export function pruneCache(opts: { query?: boolean; compileDb?: boolean; olderThanDays?: number } = {}): PruneResult {
 	const audit = auditCache();
 	const removed: PruneResult["removed"] = [];
 	const warnings: string[] = [];
@@ -1928,6 +2261,15 @@ export function pruneCache(opts: { query?: boolean; compileDb?: boolean } = {}):
 	for (const entry of audit.entries) {
 		if (!entry.reclaimable) continue;
 		drop(entry.dir, entry.kind, entry.key, entry.bytes, entry.reclaimable);
+	}
+	const olderThanDays = opts.olderThanDays && opts.olderThanDays > 0 ? opts.olderThanDays : 0;
+	if (olderThanDays) {
+		const limit = olderThanDays * 86_400_000;
+		for (const entry of audit.entries) {
+			if (entry.reclaimable || entry.kind !== "index") continue;
+			if (entry.lastUsedMs === undefined || entry.lastUsedMs <= limit) continue;
+			drop(entry.dir, entry.kind, entry.key, entry.bytes, `unused for more than ${olderThanDays} days (${Math.round(entry.lastUsedMs / 86_400_000)}d since the last lookup)`);
+		}
 	}
 	for (const flag of ["query", "compileDb"] as const) {
 		if (!opts[flag]) continue;

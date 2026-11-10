@@ -27,6 +27,11 @@ import {
 	findFileBySuffix,
 	findRowsByMember,
 	indexKeyFor,
+	indexFreshness,
+	clearFreshnessCache,
+	freshnessNote,
+	markIndexUsed,
+	patchIndex,
 	keyFingerprint,
 	listFiles,
 	headerKeyFor,
@@ -213,7 +218,8 @@ export async function ensureIndex(request: IndexRequest): Promise<IndexHandle> {
 			notes.push(`using cached index ${existing.key} (${existing.meta.counts.symbols} symbols, ${existing.meta.counts.files} files, ${humanAge(Date.now() - Date.parse(existing.meta.generatedAt))} old)`);
 			const stale = indexCoverageNote(existing);
 			if (stale) notes.push(stale);
-			return { key, index: existing, built: false, warnings: [], notes, roots: roots.roots };
+			const current = await keepCurrent(existing, roots.roots, workspace, fs, notes);
+			return { key, index: current, built: false, warnings: [], notes, roots: roots.roots };
 		}
 	}
 
@@ -249,6 +255,102 @@ export async function ensureIndex(request: IndexRequest): Promise<IndexHandle> {
 	const seconds = ((Date.now() - started) / 1000).toFixed(1);
 	notes.push(`built ${key}: ${build.counts.symbols} symbols from ${build.counts.files} files in ${seconds}s (module attribution: ${build.source})`);
 	return { key, index: loaded, built: true, durationMs: Date.now() - started, warnings, notes, roots: roots.roots };
+}
+
+/** How many changed files a lookup may patch on its own, before it tells the agent to rebuild instead. */
+export const AUTO_PATCH_LIMIT = 200;
+
+/**
+ * Keep a reused index honest: check it against the tree, patch what moved, and say so.
+ *
+ * Returning a cached index without this check is what makes the tool actively misleading — the key
+ * matches, so every line number and every new symbol in an edited file is wrong while the answer
+ * still looks authoritative. `patchIndex` is cheap (re-scan a handful of files), so a lookup fixes
+ * itself instead of asking the agent to. Past `AUTO_PATCH_LIMIT` the patch costs more than the
+ * rebuild's worth of surprise, so it warns instead.
+ */
+async function keepCurrent(state: IndexState, roots: ScanRoot[], workspace: Workspace, fs: FsAdapter, notes: string[]): Promise<IndexState> {
+	let freshness: ReturnType<typeof indexFreshness>;
+	try {
+		freshness = indexFreshness(state);
+	} catch {
+		return state;
+	}
+	const note = freshnessNote(state, freshness);
+	if (!note) {
+		markIndexUsed(state);
+		return state;
+	}
+	const stale = [...freshness.changed, ...freshness.missing];
+	if (!stale.length) {
+		// Only the scan roots moved (a module or directory was added/removed): patching files cannot
+		// express that, a rebuild can.
+		notes.push(note);
+		notes.push(`call unreal_index action "build" refresh true to rebuild ${state.key} around the new root set`);
+		markIndexUsed(state);
+		return state;
+	}
+	if (stale.length > AUTO_PATCH_LIMIT) {
+		notes.push(note);
+		notes.push(`${stale.length} files moved, more than a lookup patches on its own (limit ${AUTO_PATCH_LIMIT}): rebuild with unreal_index action "build" refresh true`);
+		markIndexUsed(state);
+		return state;
+	}
+	const started = Date.now();
+	const result = await patchIndex(state, stale, moduleResolverFor(roots, workspace));
+	const loaded = pickIndex({ key: state.key, mode: state.meta.mode, scope: state.scope, roots: state.meta.roots ?? [] }).index ?? state;
+	// The stale warning and its repair are one statement, not two: reporting "line numbers are wrong"
+	// right after fixing them is how a reader concludes the tool cannot be trusted.
+	notes.push(`index ${state.key} was stale (${freshness.changed.length} edited, ${freshness.missing.length} deleted) and was patched before this answer: ${result.updated} file(s) re-scanned in ${Date.now() - started} ms, ${result.removed} old row(s) replaced, ${result.added} file(s) had no rows before, ${result.deleted} gone from disk — these line numbers are current`);
+	markIndexUsed(loaded);
+	return loaded;
+}
+
+/** Module and scope for a single patched file, without re-running UnrealBuildTool Query. */
+export function moduleResolverFor(roots: ScanRoot[], workspace: Workspace): (file: string) => { module: string; scope: IndexScope } {
+	const sorted = [...roots].sort((a, b) => b.dir.length - a.dir.length);
+	const declared = Object.values(workspace.pluginModuleNames ?? {}).flat();
+	return (file: string) => {
+		const lower = normalizePath(file).toLowerCase();
+		const root = sorted.find((candidate) => lower.startsWith(`${normalizePath(candidate.dir).toLowerCase()}/`));
+		return {
+			module: root?.module ?? moduleFromBuildCs(file, declared) ?? moduleFromSourcePath(file) ?? "root",
+			scope: (root?.scope ?? roots[0]?.scope ?? "Project") as IndexScope,
+		};
+	};
+}
+
+/**
+ * Re-scan files the index is out of date on — or exactly the files the caller names.
+ *
+ * A lookup already does this on its own (`keepCurrent`), so this action exists for the two cases a
+ * lookup cannot serve: a batch of edits to force through immediately, and a file whose mtime a build
+ * tool reset without changing content (the explicit list overrides the freshness diff).
+ */
+export async function patchReport(input: { cwd: string; files?: string[]; scope?: "project" | "engine"; engineAreas?: string[]; fs?: FsAdapter; deps?: ResolverDeps }) {
+	const fs = input.fs ?? realFs;
+	const workspace = await resolveWorkspace(input.cwd, fs, input.deps);
+	const handle = await ensureIndex({ workspace, mode: "definitions", scope: input.scope ?? "project", engineAreas: input.engineAreas, allowEngineBuild: false, fs });
+	const state = handle.index;
+	if (!state) return { key: handle.key, index: undefined, files: 0, updated: 0, deleted: 0, notes: [...workspace.notes, ...handle.notes], warnings: handle.warnings };
+	clearFreshnessCache();
+	const freshness = indexFreshness(state, { ttlMs: 0 });
+	const targets = input.files?.length ? input.files.map(normalizePath) : [...freshness.changed, ...freshness.missing];
+	if (!targets.length) {
+		return { key: state.key, index: state, files: 0, updated: 0, deleted: 0, notes: [...workspace.notes, ...handle.notes, `nothing to patch: ${freshness.checked} indexed file(s) checked against disk, all current`], warnings: handle.warnings };
+	}
+	const started = Date.now();
+	const result = await patchIndex(state, targets, moduleResolverFor(handle.roots, workspace));
+	const reloaded = pickIndex({ key: state.key, mode: state.meta.mode, scope: state.scope, roots: state.meta.roots ?? [] }).index ?? state;
+	return {
+		key: state.key,
+		index: reloaded,
+		files: targets.length,
+		updated: result.updated,
+		deleted: result.deleted,
+		notes: [...workspace.notes, ...handle.notes, `patched ${result.updated} file(s) in ${Date.now() - started} ms: ${result.removed} old row(s) replaced, ${result.added} file(s) had no rows before, ${result.deleted} gone from disk`],
+		warnings: handle.warnings,
+	};
 }
 
 /** Coverage of an already-built index, read from its own meta — the line a warm cache must print. */
@@ -482,16 +584,17 @@ export function zeroResultNotes(input: { query: string; scope: Scope; workspace:
 
 	const wantsEngine = input.scope === "engine" || input.scope === "all";
 	if (input.workspace.engineRoot) {
+		// Printed for every 0-row answer, not just engine scope: a type that lives in an engine plugin the
+		// project does not reference is missing from the project index too, and that is precisely the
+		// case where "the engine has no such type" is wrong.
 		const gap = unreferencedEnginePlugins(input.workspace);
-		if (wantsEngine) {
-			notes.push(`engine plugins on disk: ${gap.enginePlugins}, referenced by this .uproject: ${gap.referenced}; the engine index scans referenced plugins only`);
-			notes.push(`a plugin the project does not reference is not in any index root: pass engineAreas ["Plugins"] (every Engine/Plugins source, ~2.8x the Runtime scan) or ["Plugins/<Category>/<Plugin>"] for one plugin`);
-			const near = rankNamesByQuery(gap.names, input.query);
-			if (near.length) notes.push(`unreferenced engine plugins whose name matches the query: ${near.slice(0, 6).join(", ")}${gap.names.length > 6 ? ` (of ${gap.names.length} unreferenced engine plugins with sources here)` : ""}`);
-		}
+		notes.push(`engine plugins on disk: ${gap.enginePlugins}, referenced by this .uproject: ${gap.referenced}; index roots cover referenced plugins only (this answer's scope was "${input.scope}")`);
+		notes.push(`a plugin the project does not reference is in no index root: pass scope "engine" with engineAreas ["Plugins"] (every Engine/Plugins source) or ["Plugins/<Category>/<Plugin>"] for one plugin`);
+		const near = rankNamesByQuery(gap.names, input.query);
+		if (near.length) notes.push(`unreferenced engine plugins whose name matches the query: ${near.slice(0, 6).join(", ")}${gap.names.length > 6 ? ` (of ${gap.names.length} unreferenced engine plugins with sources here)` : ""}`);
 		notes.push(input.header ? `header index ${input.header.key} covers ${rootKindsNote(input.header.meta.roots, { engineRoot: input.header.meta.engineRoot })}` : `asking whether a header exists is a path question, not a symbol question: unreal_index action "headers" (path walk only, seconds) answers it from ${input.workspace.engineRoot}/Engine/Plugins and Engine/Source`);
-	}
-	if (!wantsEngine) {
+		if (!wantsEngine) notes.push("the project index does not scan engine sources at all: pass scope \"engine\" (first build takes minutes) or scope \"all\" for engine declarations");
+	} else if (!wantsEngine) {
 		notes.push("a project index contains the project and its enabled plugins only; engine sources are not scanned: pass scope \"engine\" (first build takes minutes) or scope \"all\"");
 	}
 
@@ -1007,26 +1110,32 @@ export async function buildContext(input: BuildContextInput) {
 export function indexStatus(cwd: string, fs: FsAdapter = realFs, workspace?: Workspace) {
 	const root = cacheDir(fs);
 	const audit = auditCache();
-	const indexes = listIndexes().map((state) => ({
-		key: state.key,
-		mode: state.meta.mode,
-		generatedAt: state.meta.generatedAt,
-		ageMs: Date.now() - Date.parse(state.meta.generatedAt),
-		defs: state.meta.counts?.symbols ?? 0,
-		files: state.meta.counts?.files ?? 0,
-		defsByKind: state.meta.defsByKind,
-		source: state.meta.source,
-		target: state.meta.target,
-		scope: state.scope,
-		roots: state.meta.roots.length,
-		rootKinds: state.meta.rootKinds,
-		coverage: rootKindsNote(state.meta.roots, { projectRoot: state.meta.projectRoot, engineRoot: state.meta.engineRoot }),
-		areas: state.meta.areas,
-		sizeMb: Math.round(state.meta.sizeBytes / 1024 / 1024),
-		expectedKey: expectedKeyFor(state),
-		selectedByLookups: keyFingerprint(state.key) === keyFingerprint(expectedKeyFor(state)),
-		issues: state.issues,
-	}));
+	const lastUsed = new Map(audit.entries.filter((entry) => entry.kind === "index").map((entry) => [entry.key, entry.lastUsedMs]));
+	const indexes = listIndexes().map((state) => {
+		const freshness = indexFreshness(state, { maxFiles: 25_000 });
+		return {
+			key: state.key,
+			mode: state.meta.mode,
+			generatedAt: state.meta.generatedAt,
+			ageMs: Date.now() - Date.parse(state.meta.generatedAt),
+			lastUsedMs: lastUsed.get(state.key),
+			defs: state.meta.counts?.symbols ?? 0,
+			files: state.meta.counts?.files ?? 0,
+			defsByKind: state.meta.defsByKind,
+			source: state.meta.source,
+			target: state.meta.target,
+			scope: state.scope,
+			roots: state.meta.roots.length,
+			rootKinds: state.meta.rootKinds,
+			coverage: rootKindsNote(state.meta.roots, { projectRoot: state.meta.projectRoot, engineRoot: state.meta.engineRoot }),
+			areas: state.meta.areas,
+			sizeMb: Math.round(state.meta.sizeBytes / 1024 / 1024),
+			expectedKey: expectedKeyFor(state),
+			selectedByLookups: keyFingerprint(state.key) === keyFingerprint(expectedKeyFor(state)),
+			freshness: { checked: freshness.checked, changed: freshness.changed.length, missing: freshness.missing.length, movedRoots: freshness.movedRoots.length, supported: freshness.supported, truncated: freshness.truncated },
+			issues: state.issues,
+		};
+	});
 	const headers = listHeaderIndexes().map((header) => ({
 		key: header.key,
 		generatedAt: header.meta.generatedAt,
@@ -1054,6 +1163,13 @@ export function indexStatus(cwd: string, fs: FsAdapter = realFs, workspace?: Wor
 	}
 	const dead = audit.entries.filter((entry) => entry.reclaimable);
 	notes.push(audit.notes[0] ?? "");
+	for (const index of indexes) {
+		if (!index.freshness.supported) notes.push(`index ${index.key}: freshness unknown (this format predates per-file mtimes) → unreal_index action "build" refresh true rebuilds it once and staleness tracking starts`);
+		else if (index.freshness.changed || index.freshness.missing) {
+			notes.push(`index ${index.key} is STALE against the tree: ${index.freshness.changed} edited, ${index.freshness.missing} deleted file(s) since it was built${index.freshness.truncated ? " (first 25,000 files checked)" : ""} — a lookup re-scans them on reuse (up to 200 files); refresh true rebuilds instead`);
+		}
+		if (index.lastUsedMs !== undefined && index.lastUsedMs > 30 * 86_400_000) notes.push(`index ${index.key} has not been selected by a lookup in ${Math.round(index.lastUsedMs / 86_400_000)} days (~${index.sizeMb} MB): unreal_index action "prune" olderThanDays 30 deletes it`);
+	}
 	if (dead.length) {
 		notes.push(`reclaimable ${dead.map((entry) => `${entry.kind} ${entry.key} (${(Math.round((entry.bytes / 1024 / 1024) * 10) / 10).toFixed(1)} MB: ${entry.reclaimable})`).join(" · ")}`);
 		notes.push(`unreal_index action "prune" deletes exactly these (derived data: every one is rebuildable); query/ and compiledb/ need the explicit query / compileDb flags`);
@@ -1075,7 +1191,7 @@ export function indexStatus(cwd: string, fs: FsAdapter = realFs, workspace?: Wor
 			: `no live compile database: clangd has none in ${dirs.dirs.join(" | ") || "(no directory)"} → get_diagnostics can only guess flags. unreal_index action "clangd" prints the file-level probe`);
 	}
 	notes.push('clangd health (is the database it reads current?): unreal_index action "clangd" — reads the project .clangd, counts live-database entries against the TU set on disk, names missing files');
-	return { cacheDir: root, indexes, headers, notes, cache: { reclaimableBytes: audit.reclaimableBytes, keptBytes: audit.keptBytes, entries: audit.entries.map((entry) => ({ kind: entry.kind, key: entry.key, bytes: entry.bytes, ageMs: entry.ageMs, reclaimable: entry.reclaimable, counts: entry.counts })) }, compileDbs, roots: workspace ? currentRootSets(workspace, { fs }) : undefined, query: { target: choice, usable: query.usable, targetDetails: query.targetDetails, moduleReferences: query.moduleReferences, notes: query.notes } };
+	return { cacheDir: root, indexes, headers, notes, cache: { reclaimableBytes: audit.reclaimableBytes, keptBytes: audit.keptBytes, entries: audit.entries.map((entry) => ({ kind: entry.kind, key: entry.key, bytes: entry.bytes, ageMs: entry.ageMs, lastUsedMs: entry.lastUsedMs, reclaimable: entry.reclaimable, counts: entry.counts })) }, compileDbs, roots: workspace ? currentRootSets(workspace, { fs }) : undefined, query: { target: choice, usable: query.usable, targetDetails: query.targetDetails, moduleReferences: query.moduleReferences, notes: query.notes } };
 }
 
 export { hostPlatform };
@@ -1104,12 +1220,30 @@ export async function indexBuild(input: IndexBuildInput) {
 	const notes: string[] = [];
 	let queryFiles: CachePaths | undefined;
 
-	if (input.mode === "full") {
-		if (!workspace.engineRoot) return { key: "none", built: false, symbols: 0, files: 0, durationMs: 0, roots: 0, notes: [...workspace.notes, "no engine resolved, so UnrealBuildTool Query cannot run (run unreal_resolve_engine)"] };
-		const choice = pickTarget({ cwd: input.cwd, target: input.target, platform: input.platform, configuration: input.configuration, engineRoot: workspace.engineRoot, fs });
-		const ensured = await ensureQueryJson({ cacheRoot: cacheDir(fs), choice, engineRoot: workspace.engineRoot, refresh: input.refresh, fs, onStdout: input.onProgress });
-		notes.push(...ensured.notes);
-		queryFiles = ensured.paths;
+	if (!workspace.engineRoot) {
+		if (input.mode === "full") return { key: "none", built: false, symbols: 0, files: 0, durationMs: 0, roots: 0, notes: [...workspace.notes, "no engine resolved, so UnrealBuildTool Query cannot run (run unreal_resolve_engine)"] };
+		notes.push("no engine resolved: module attribution falls back to the nearest *.Build.cs");
+	} else {
+		// Module attribution defaults to UBT Query whenever a usable Query cache exists, even in
+		// definitions mode: the engines own `TargetModuleReferences` dirToModule is the only
+		// authoritative answer to "which module owns this file", and a cache hit costs three stats.
+		// `mode: "full"` additionally *runs* Query when the cache is cold or refresh is set.
+		try {
+			const choice = pickTarget({ cwd: input.cwd, target: input.target, platform: input.platform, configuration: input.configuration, engineRoot: workspace.engineRoot, fs });
+			const cached = queryCacheState(cacheDir(fs), choice, fs);
+			if (input.mode === "full") {
+				const ensured = await ensureQueryJson({ cacheRoot: cacheDir(fs), choice, engineRoot: workspace.engineRoot, refresh: input.refresh, fs, onStdout: input.onProgress });
+				notes.push(...ensured.notes);
+				queryFiles = ensured.paths;
+			} else if (cached.usable) {
+				queryFiles = cached.paths;
+				notes.push(`module attribution: UnrealBuildTool Query cache for ${choice.target} ${choice.platform} ${choice.configuration} (dirToModule), not the *.Build.cs heuristic`);
+			} else {
+				notes.push(`module attribution: nearest *.Build.cs (heuristic). The Query cache for ${choice.target} is empty: one run of action "build" mode "full" fills it (~17 s) and every later index gets UBT-accurate module names`);
+			}
+		} catch (error) {
+			notes.push(`module attribution: nearest *.Build.cs (heuristic) — target discovery/Query cache unavailable: ${String(error)}`);
+		}
 	}
 
 	const handle = await ensureIndex({
@@ -1358,7 +1492,7 @@ function formatMissingTus(missing: { file: string; module?: string }[] | undefin
  * entry. `query/` and `compiledb/` need explicit flags: Query costs ~12 s per target and
  * GenerateClangDatabase costs minutes.
  */
-export function pruneReport(opts: { query?: boolean; compileDb?: boolean } = {}) {
+export function pruneReport(opts: { query?: boolean; compileDb?: boolean; olderThanDays?: number } = {}) {
 	// Audit BEFORE the delete: the same audit re-run afterwards no longer sees the entries it removed,
 	// so a `before` measured after the prune is byte-for-byte the `after` number.
 	const before = auditCache();

@@ -36,24 +36,31 @@ the answer is full. An earlier build accumulated every row in an array and died 
 1.91 GB (`ReachJSValueFormalMemoryCommit Allocation failed: out of memory`) — which is the failure
 mode of "just load the index" at engine scale.
 
-Measured on this box (UE 5.8.3 installed engine; Lp project with 25 enabled plugins):
+Measured on this box (UE 5.8.3 installed engine; Lp project with 28 enabled plugin references).
+Counts move when the **scanner** changes, not when the codebase does: the 1.2 numbers
+(50,440 project / 437,614 engine symbols) were produced before the 1.3 precision pass, which drops
+local declarations (`FScopeLock Lock(&Cs);` was being recorded as a function named `Lock`) and adds
+destructors (1,959 in the engine index, 148 in the project index, previously zero). Treat any figure
+here as a measurement with a version attached, and read the live one from
+`unreal_index action: "status"`.
 
 | Scope | Files | Definitions | Cold build |
 | --- | --- | --- | --- |
-| Project + plugins | 2,405 | 38,901 | 6.7 s (3,264 files / 50,440 symbols on the 1.2 fixture project, 1.9 s) |
-| Engine `Runtime` (shipped default: 279 module roots) | 18,566 | 436,729 | 57.6 s cold, 5.7 s warm |
-| Engine `Runtime` + 62 enabled plugin roots (1.1 engine key, includes `.uproject` plugin roots) | 20,966 | 476,327 | 122 s cold, 0.4 s warm |
+| Project + enabled plugins (format v7, `source: "ubt"`) | 3,264 | 48,645 | 20.5 s cold, 0.15 s per patched file |
+| Engine `Runtime` (default: 279 module roots, format v7) | 18,566 | 420,603 | 112.8 s cold on a cold file cache, 0.3-0.6 s warm |
 | Engine `Runtime` + every `Engine/Plugins` source (1.1 engine key) | 71,004 | 1,240,246 | ~2 min cold (1,996 roots: 279 engine-source + 1,717 engine-plugin) |
 | Engine `Runtime/Core` + `Runtime/CoreUObject` | 3,094 | 70,548 | 16 s |
 | Header index (paths only, engine `Runtime` + all `Engine/Plugins`) | 37,788 headers | — | 4.5 s cold, 0.5 s warm |
-| Cached lookup | — | — | ~0.3 s |
+| Cached lookup (includes the freshness re-stat, memoized 10 s) | — | — | 0.3 s project, 0.3-0.6 s engine |
 
 Cost discipline is the design. A lookup builds the project index (seconds) and uses an engine
 index only if one exists; `scope: "engine"` on a cold machine returns
 `engine index not built — build it with unreal_index (action: "build", scope: "engine")` instead of
 spending minutes on a scan nobody asked for. `unreal_index` is the explicit, paid path.
 
-Ranking inside `unreal_symbol`: exact (0) → qualified member (1) → prefix (2) → substring (3).
+Ranking inside `unreal_symbol`: exact (0) → prefix or UE-prefix convention letter (1) → qualified
+member fallback (2) → substring (3); a forward declaration adds 1, so it never outranks the real
+declaration.
 Forward declarations rank last, so `unreal_symbol AActor` returns
 `Engine/Source/Runtime/Engine/Classes/GameFramework/Actor.h:282` (the `UCLASS` declaration), not
 the `class AActor;` line in `PhysicsCollision.h`.
@@ -63,6 +70,36 @@ Engine areas are derived from module dependencies (`.uproject` modules → recur
 `PublicDependencyModuleNames` → plugin-supplied modules → recursive `PublicDependencyModuleNames` →
 `Engine/Source/<area>/*`), so the index contains what this project can compile against, not the
 whole engine.
+
+### Freshness: a reused index is checked, then patched (`action: "patch"`)
+
+Key equality only says *what* was scanned, never *whether it still matches the tree*. Between two
+sessions the project gets edited, and a cached index that keeps answering with the old line numbers is
+the worst failure mode this package can have: the file and symbol are right, the line is wrong, and
+nothing in the answer looks stale.
+
+So a reused index is verified before it is trusted:
+
+1. `files.tsv` carries a per-file `mtimeMs` (format v7) and `meta.json` carries `rootsState` (one
+   mtime per scan root) plus `freshness.newestMtimeMs`.
+2. `indexFreshness(index)` stats every indexed file (`|current - recorded| > 1 ms` counts as edited,
+   `ENOENT` as deleted) and re-stats the roots. Cost: ~250 ms for the 18.5 k-file engine index,
+   memoized for `FRESHNESS_TTL_MS = 10_000` so a burst of lookups pays once.
+3. `keepCurrent` (in `ensureIndex`) patches `changed + missing` through `patchIndex` — re-scan those
+   files, replace their rows, restamp their `files.tsv` rows, rewrite `meta.counts` — when the set is
+   at most `AUTO_PATCH_LIMIT = 200` files. Measured: 150 ms for one edited `.cpp` in the 3.3 k-file
+   project index. The note is one sentence covering both the finding and the repair, because "line
+   numbers are wrong" printed immediately after fixing them reads as an unfixed warning.
+4. Past the limit, or when only the *roots* moved (a module or directory added — a patch cannot
+   express that), the lookup warns and hands the rebuild to `unreal_index action: "build" refresh:
+   true`.
+5. An index in an older format has no mtime column: `indexFreshness` returns `supported: false` and
+   the answer says staleness cannot be checked rather than implying it was.
+
+`action: "patch"` is the explicit form of the same machinery: no `files` patches whatever the
+freshness diff finds, an explicit `files` list patches exactly those (the case a mtime cannot express
+— a build tool that rewrites timestamps without changing content). `status` prints the same numbers
+(`freshness: N edited / M deleted of K checked`) so the cost of a lookup is visible before it runs.
 
 ### Engine scope is engine-only (1.2): the union does the plugin work
 
@@ -261,13 +298,21 @@ the same coverage line cheaply (the probe is the file-level detail).
 
 Cache growth was the 2026-10-28 finding: 481 MB in `~/.pi/agent/unreal-cache`, 177 MB of it (37 %)
 unreachable. `status` now reports an `index cache: N MB live, M MB reclaimable (K entry(ies))` line,
-labels every reclaimable entry with a reason (`superseded (… roots)`, `keyed by its root set`, `format
-v4/v5, current v6`, `root no longer present: <path>`), prints the root set current lookups ask for
-(`current root set — engine: 279 engine-source root(s); project: 1 project root(s), 25 engine-plugin
-root(s)`) and names orphaned keys with the key the next lookup computes. `prune` deletes exactly the
-entries `status` marks reclaimable — index and header directories only, never `query/`, `compiledb/`
-or the plugin cache, and `prune compileDb: true` is required to touch those. Measured: 177 MB returned
-from the five dead entries; the audit is idempotent (a second `prune` finds nothing).
+labels every reclaimable entry with a reason (`superseded (… roots)`, `keyed by its root set`,
+`format v<N>, current v7`, `root no longer present: <path>`, `project root has no .uproject: <path>`),
+prints the root set current lookups ask for and names orphaned keys with the key the next lookup
+computes. `prune` deletes exactly the entries `status` marks reclaimable — index and header
+directories only, never `query/`, `compiledb/` or the plugin cache, and `prune compileDb: true` is
+required to touch those. Measured: 177 MB returned from the five dead entries; the audit is
+idempotent (a second `prune` finds nothing).
+
+**Unused, not just unreachable.** Reachability alone keeps an index forever: a key is "live" as long
+as the tree it was built from still exists, and a 135 MB cache on this box carried a second project
+index nothing had asked for in 12 days. Every reuse path now writes a `.used` marker in the index
+directory (`markIndexUsed`), `status` reports `lastUsedMs` per entry and warns past 30 days, and
+`prune olderThanDays: 30` deletes healthy-but-unselected indexes. That is a separate opt-in from the
+reclaimable sweep: bytes are cheap to rebuild, a wrong line number is not, but 135 MB of never-opened
+indexes is not evidence of anything either.
 
 `callsites` is the deliberate exception to "declarations only", and it is bounded and labelled. The
 field session needed `ALpMoverPawn::ProduceInput` callers; the compile database has no engine TUs and
@@ -379,13 +424,26 @@ Field names, host types, and loading phases are transcribed from the engine's se
   `USceneComponent`, 18,566 files) — in an installed engine that is not every gameplay type, because
   the ones shipped by plugins (`Mover`, `PoseSearch`, `PhysicsControl`, `BlendStack`, `SmartObjects`,
   `StateTree`, `GameplayAbilities`) live under `Engine/Plugins/<Category>/<Plugin>/Source/<module>`.
-  Engine-scope indexes add the plugin roots the `.uproject` enables; the rest are opt-in via
-  `engineAreas: ["Plugins"]` (~2.8× the `Runtime` scan) or `["Plugins/Animation/PhysicsControl"]`
-  for one plugin. `Editor` and `Developer` are opt-in and roughly triple the scan.
+  Engine-scope indexes cover the engine's own sources plus the `engineAreas` dial of
+  `Engine/Plugins` trees only — the plugin roots the `.uproject` enables belong to the **project**
+  index, so a `scope: "engine"` or `"all"` answer is the union of both (1.2 changed this: 1.1
+  folded project plugin roots into the engine key, which made the key depend on the `.uproject`).
+  Plugin-shipped types are opt-in via `engineAreas: ["Plugins"]` (~2.8× the `Runtime` scan) or
+  `["Plugins/Animation/PhysicsControl"]` for one plugin. `Editor` and `Developer` are opt-in and
+  roughly triple the scan.
 - pi-unreal answers C++ **declaration, module, include-path and dependency** facts. It does not
   answer asset questions: UENUM index order (Blueprint enumerators are stored in index order, so
   `4 = OnGround` is an asset fact), UStruct field types, UCLASS/CDO instance values, component
-  lists, parent chains, Blueprint graphs. Those need the `unreal-engine` editor MCP with the editor
-  running; a C++ scan cannot see them and must not pretend to.
+  lists, parent chains, Blueprint graphs or Blueprint authoring conventions. Those need the
+  `unreal-engine` editor MCP with the editor running; a C++ scan cannot see them and must not
+  pretend to. This is the boundary the tool list encodes: the package name promises UE awareness,
+  and "Blueprint awareness" is only ever an edge to C++ (`UFUNCTION`/`UPROPERTY` markers, the
+  `_Implementation` thunk rule, `UCLASS` specifiers) — never graph content.
 - Index reuse requires the *same root set*: an index built over two modules is never used to answer
   a `Runtime`-wide query. Partial coverage reported as an answer is worse than a rebuild.
+- A reused index is checked against the tree (`indexFreshness`): per-file mtimes are stored in
+  `files.tsv`, so an edited or deleted file is detected and re-scanned before the answer (up to
+  `AUTO_PATCH_LIMIT = 200` files per lookup — 150 ms for one file on the 3.3 k-file project index).
+  Past that, or when only the scan roots moved, the lookup warns and hands the rebuild back to
+  `unreal_index`. An index written before v7 has no mtime column and says so (`supported: false`)
+  instead of claiming freshness it cannot prove.

@@ -47,8 +47,14 @@ function editorRunning(ttlMs = 4000): boolean {
 	if (editorProbe && now - editorProbe.atMs < ttlMs) return editorProbe.running;
 	let running = false;
 	try {
-		const out = execFileSync("tasklist", ["/FO", "CSV", "/NH", "/FI", "IMAGENAME eq UnrealEditor*"], { encoding: "utf8", timeout: 4000, windowsHide: true });
-		running = /unrealeditor/i.test(out);
+		if (process.platform === "win32") {
+			const out = execFileSync("tasklist", ["/FO", "CSV", "/NH", "/FI", "IMAGENAME eq UnrealEditor*"], { encoding: "utf8", timeout: 4000, windowsHide: true });
+			running = /unrealeditor/i.test(out);
+		} else {
+			// `tasklist` does not exist off Windows; without this branch the live-editor warning was
+			// silently inert (every spawn threw into the catch) instead of saying what it knew.
+			running = execFileSync("pgrep", ["-f", "UnrealEditor"], { encoding: "utf8", timeout: 4000 }).trim().length > 0;
+		}
 	} catch {
 		running = false;
 	}
@@ -556,9 +562,10 @@ async function buildContextCard(cwd: string): Promise<string | undefined> {
 		...engineLines(resolution).map((line) => `  ${line}`),
 		`  modules: ${descriptor.modules.map((entry) => `${entry.moduleName}(${entry.descriptor.type ?? "Runtime"})`).join(" ") || "none"}`,
 		`  plugin references declared: ${descriptor.plugins.length}`,
-		"  engine sources for this machine live under C:/Program Files/Epic Games (UE_*) plus source builds; registry + dir-scan are consulted by the tools — do not infer.",
+		"  engine sources: use the resolved root above + unreal_context for module/include facts; never infer an engine path from memory.",
 		"  conventions: editor closed before C++ edits; never hand-edit .uasset/.umap; never clang-format .cs.",
-		"  tools: unreal_resolve_engine, unreal_project_inspect, unreal_plugin_inspect. Commands: /unreal, /unreal-engines, /unreal-cache.",
+		`  tools: unreal_resolve_engine, unreal_project_inspect, unreal_plugin_inspect, unreal_symbol (declaration → file:line + module, project+plugins, engine when an engine index exists), unreal_symbol_list (symbols in a file), unreal_context (module deps, include paths, defines), unreal_index (build/status/patch/prune, header index, UBT Query, compile database). Commands: /unreal, /unreal-engines, /unreal-cache, /unreal-symbol, /unreal-module.`,
+		`  gates: .uasset/.umap edits are blocked on every platform; the "editor is running" warning needs tasklist (Windows) or pgrep (elsewhere) on PATH — ${process.platform === "win32" ? "tasklist" : "pgrep"} is the probe here.`,
 	];
 	return lines.join("\n");
 }

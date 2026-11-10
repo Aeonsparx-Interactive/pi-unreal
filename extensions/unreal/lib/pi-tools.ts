@@ -15,7 +15,7 @@ import { Type } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 
 import { normalizePath, realFs, truncateLines, type JsonValue } from "./util.ts";
-import { buildContext, callSitesReport, clangdHealthReport, compileDbReport, fileContext, headerReport, indexBuild, indexStatus, pruneReport, symbolList, symbolLookup, type Scope } from "./tools.ts";
+import { buildContext, callSitesReport, clangdHealthReport, compileDbReport, fileContext, headerReport, indexBuild, indexStatus, patchReport, pruneReport, symbolList, symbolLookup, type Scope } from "./tools.ts";
 
 /* ──────────────────────────────────────────────────────────────────────────── schemas */
 
@@ -79,7 +79,7 @@ const ContextParams = Type.Object({
 
 const IndexParams = Type.Object({
 	cwd: CwdSchema,
-	action: Type.Union([Type.Literal("build"), Type.Literal("status"), Type.Literal("headers"), Type.Literal("compiledb"), Type.Literal("prune"), Type.Literal("clangd"), Type.Literal("callsites")], { description: "'build' creates or refreshes a symbol index. 'status' lists what is cached, what each index covers by root kind, the root set current lookups ask for, near-miss index keys, reclaimable cache bytes, and the generated compile databases. 'headers' builds the path-only header index and answers 'does this header exist in this engine version' (walks file paths, no content read: seconds). 'compiledb' runs UnrealBuildTool -Mode=GenerateClangDatabase and normalizes it for clangd (minutes, ~1 GB for the engine scope); pass check <file> for the clangd --check proof and installTo <dir> to copy it where clangd reads. 'clangd' is the compiler-free clangd health probe: reads the project's .clangd, counts the live database against the translation units on disk, names deleted files and uncovered sources, and reports the per-file compile-command gate. 'prune' deletes the indexes status marks reclaimable. 'callsites' is an opt-in bounded text pass over a module's .cpp tree listing candidate rows that mention a member (candidates, not call edges)." }),
+	action: Type.Union([Type.Literal("build"), Type.Literal("status"), Type.Literal("headers"), Type.Literal("compiledb"), Type.Literal("prune"), Type.Literal("patch"), Type.Literal("clangd"), Type.Literal("callsites")], { description: "'build' creates or refreshes a symbol index. 'status' lists what is cached, what each index covers by root kind, the root set current lookups ask for, near-miss index keys, per-index staleness against the tree (files edited/deleted since the build), last use, reclaimable cache bytes, and the generated compile databases. 'patch' re-scans only the files whose mtime moved (what a lookup does by itself) or exactly the files you name — seconds, no full rebuild. 'headers' builds the path-only header index and answers 'does this header exist in this engine version' (walks file paths, no content read: seconds). 'compiledb' runs UnrealBuildTool -Mode=GenerateClangDatabase and normalizes it for clangd (minutes, ~1 GB for the engine scope); pass check <file> for the clangd --check proof and installTo <dir> to copy it where clangd reads. 'clangd' is the compiler-free clangd health probe: reads the project's .clangd, counts the live database against the translation units on disk, names deleted files and uncovered sources, and reports the per-file compile-command gate. 'prune' deletes the indexes status marks reclaimable, plus any index unused for olderThanDays. 'callsites' is an opt-in bounded text pass over a module's .cpp tree listing candidate rows that mention a member (candidates, not call edges)." }),
 	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("engine"), Type.Literal("project+engine")], { description: "Index scope for 'build': 'project' (default, seconds) or 'engine' (Engine/Source areas + the project's enabled plugin roots; minutes the first time). For 'headers': 'engine' (default) = engine sources + every Engine/Plugins tree, 'project' = project + its plugins, 'project+engine' = both. For 'compiledb': 'project' (default) = project + enabled plugin sources, 'project+engine' adds all of Engine/Source and Engine/Plugins." })),
 	mode: Type.Optional(Type.Union([Type.Literal("definitions"), Type.Literal("full")], { description: "'definitions' = symbol -> file:line only (default, fast). 'full' also records per-file include sets and needs UnrealBuildTool Query (~7s, no compiler)." })),
 	name: Type.Optional(Type.String({ description: "For action 'headers': the header to answer, e.g. 'MoverState.h', 'PhysicsControlComponent.h', or a partial path 'Mover/Public/MoverTypes.h'. Absent = build/report only." })),
@@ -94,6 +94,8 @@ const IndexParams = Type.Object({
 	module: Type.Optional(Type.String({ description: "For 'callsites': restrict the text pass to this module (default: the modules the symbol's declarations live in)." })),
 	query: Type.Optional(Type.Boolean({ description: "For 'prune': also delete the cached UnrealBuildTool Query JSON (it is re-run in seconds when needed). Default false." })),
 	compileDb: Type.Optional(Type.Boolean({ description: "For 'prune': also delete the generated compile databases. Default false." })),
+	olderThanDays: Type.Optional(Type.Number({ description: "For 'prune': also delete healthy indexes no lookup has selected for this many days (marker file .used in the index dir, else build time). A 135 MB cache lives here; olderThanDays 30 is the safe sweep." })),
+	files: Type.Optional(Type.Array(Type.String(), { description: "For 'patch': the exact files to re-scan (absolute, or relative to cwd). Absent = the files whose mtime differs from the index." })),
 });
 
 /* ──────────────────────────────────────────────────────────────────────────── rendering */
@@ -107,8 +109,10 @@ const shortPath = (file: string | undefined, cwd: string) => {
 	return f.startsWith(`${base}/`) ? f.slice(base.length + 1) : f;
 };
 
-const rowLine = (row: { symbol: string; kind: string; file: string; line: number; module: string; scope?: string }, cwd: string) =>
-	`  ${row.kind} ${row.symbol}  ${shortPath(row.file, cwd)}:${row.line}  [${row.module}${row.scope ? ` · ${row.scope}` : ""}]`;
+const rowLine = (row: { symbol: string; kind: string; file: string; line: number; module: string; scope?: string; snippet?: string }, cwd: string) => {
+	const head = `  ${row.kind} ${row.symbol}  ${shortPath(row.file, cwd)}:${row.line}  [${row.module}${row.scope ? ` · ${row.scope}` : ""}]`;
+	return row.snippet ? `${head}\n      ${row.snippet}` : head;
+};
 
 function result(text: string, details: unknown, isError = false) {
 	return {
@@ -142,6 +146,7 @@ const DefRowOut = Type.Object({
 	marker: Type.String(),
 	rank: Type.Number(),
 	match: Type.String(),
+	snippet: Type.Optional(Type.String()),
 });
 const IndexRefOut = Type.Object({ key: Type.String(), scope: Type.String(), defs: Type.Number(), files: Type.Optional(Type.Number()), generatedAt: Type.Number() });
 
@@ -204,6 +209,7 @@ export const unrealSymbol = defineTool({
 		"Default scope is 'project' (project modules + enabled plugins). Engine types (AActor, UAnimInstance, FWorldDelegates) need scope 'engine', which requires an engine index: unreal_index action build scope engine — minutes the first time, cached afterwards, engineAreas [\"Runtime\"] keeps it to the engine's own sources. An engine index covers Engine/Source areas plus the plugin roots the .uproject enables; types shipped by plugins the project does NOT reference (PhysicsControl, BlendStack, StateTree, GameplayAbilities...) need engineAreas [\"Plugins\"].",
 		"Qualify member lookups: query 'Tick' with owner 'AActor', or query 'AActor:Tick'. Use prefix: true for name families ('ULp', 'ANiMy') and substring: true for qualified members ('Enable' finds 'UPhysicsControlBPLibrary:Enable'), never to silently accept a typo.",
 		"A 0-row answer is a statement about the roots that were scanned, not about the engine: read the coverage lines it prints. Asking whether a header exists in this engine version is a path question — use unreal_index action 'headers' name 'X.h', not a symbol lookup.",
+		"Each row carries the declaration line's own text under it, so a hit usually needs no follow-up read; open the file only when you need surrounding context.",
 		"A definition line is a starting point, not an answer: read that file at that line. For engine call graphs clangd (MCP) is more precise; for module/link facts use unreal_context.",
 	],
 	parameters: SymbolParams,
@@ -354,8 +360,9 @@ export const unrealIndex = defineTool({
 				`  TargetModuleReferences: ${out.query.moduleReferences ? `${Math.round(out.query.moduleReferences.bytes / 1024)} KB, ${Math.round(out.query.moduleReferences.ageMs / 1000)}s old` : "absent"}`,
 			];
 			for (const index of out.indexes) {
-				lines.push(`index ${index.key}  ${index.scope || "?"} ${index.mode}  ${index.defs} symbols / ${index.files} files  ${index.source}${index.target ? ` target=${index.target}` : ""}  ${Math.round(index.ageMs / 1000)}s old  ${index.sizeMb}MB${index.issues.length ? `  issues: ${index.issues.join("; ")}` : ""}`);
-				lines.push(`  covers ${index.coverage}${index.areas?.length ? `  engineAreas: ${index.areas.join(", ")}` : ""}`);
+				lines.push(`index ${index.key}  ${index.scope || "?"} ${index.mode}  ${index.defs} symbols / ${index.files} files  ${index.source}${index.target ? ` target=${index.target}` : ""}  built ${Math.round(index.ageMs / 1000)}s ago  ${index.sizeMb}MB${index.lastUsedMs === undefined ? "" : `  last used ${Math.round(index.lastUsedMs / 1000)}s ago`}${index.issues.length ? `  issues: ${index.issues.join("; ")}` : ""}`);
+				const fresh = index.freshness;
+				lines.push(`  covers ${index.coverage}${index.areas?.length ? `  engineAreas: ${index.areas.join(", ")}` : ""}${fresh ? `  freshness: ${fresh.changed} edited / ${fresh.missing} deleted of ${fresh.checked} checked${fresh.supported ? "" : " (format predates mtimes: rebuild)"}` : ""}`);
 			}
 			if (!out.indexes.length) lines.push("no symbol index yet — unreal_index action build scope project (seconds)");
 			for (const header of out.headers) {
@@ -409,7 +416,7 @@ export const unrealIndex = defineTool({
 		}
 
 		if (params.action === "prune") {
-			const out = pruneReport({ query: params.query, compileDb: params.compileDb });
+			const out = pruneReport({ query: params.query, compileDb: params.compileDb, olderThanDays: params.olderThanDays });
 			const text = [
 				`unreal_index prune → ${out.removed.length} entr${out.removed.length === 1 ? "y" : "ies"}, ${out.freedMb} reclaimed (cache ${(out.beforeBytes / 1024 / 1024).toFixed(1)} MB → ${(out.afterBytes / 1024 / 1024).toFixed(1)} MB)`,
 				...out.removed.map((entry) => `  deleted ${entry.kind} ${entry.key} (${entry.mb}) — ${entry.reason}`),
@@ -418,6 +425,16 @@ export const unrealIndex = defineTool({
 				...out.warnings.map((w) => `! ${w}`),
 			].join("\n");
 			return result(text, out as unknown as Record<string, JsonValue>);
+		}
+
+		if (params.action === "patch") {
+			const out = await patchReport({ cwd: params.cwd ?? ctx.cwd, files: params.files, scope: params.scope === "engine" ? "engine" : "project", engineAreas: params.engineAreas, fs: realFs });
+			const lines = [
+				`unreal_index patch → ${out.key}  ${out.updated} file(s) re-scanned, ${out.deleted} gone from disk`,
+				...out.notes.map((n) => `· ${n}`),
+				...out.warnings.map((w) => `! ${w}`),
+			];
+			return result(lines.join("\n"), out as unknown as Record<string, JsonValue>);
 		}
 
 		if (params.action === "clangd") {

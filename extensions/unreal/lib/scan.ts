@@ -126,7 +126,16 @@ const RE_SPECIFIER = /^\s*(UPROPERTY|UFUNCTION|UMETA|UPARAM|UDELEGATE)\b/;
  *     (a bare `Foo::Bar()` call has one, so it is rejected), and carries no `=`;
  *   - the text after the matching `)` is qualifiers (`const`, `override`, `final`, `noexcept`,
  *     `[[attr]]`, `= 0`) and at most one `{`, and contains no `(`;
+ *   - in a source file a `;`-terminated signature with no `Qualifier::` is a **declaration of a
+ *     local variable**, not a function: `FScopeLock Lock(&Cs);` and `TPropertyCombinationSet<W>
+ *     CopyConstructed(X);` are the same shape as a signature and were 18,470 of 37,562 unqualified
+ *     `.cpp` rows. A definition's body opens on the next line (Allman) or on this one, so a real
+ *     `.cpp` row carries `{` or nothing — never a bare `;`. Headers keep the row: that is where a
+ *     declaration with `;` legitimately lives;
  *   - control flow, preprocessor, `operator`, and template lines are excluded.
+ *
+ * Destructors are in scope (`~AActor()`): they are the declaration an agent asks for when it hunts a
+ * cleanup path, and the `~` is part of the symbol (`AActor:~AActor`) rather than a second kind.
  */
 const RE_HEAD = /^(?<type>(?:(?:const|static\s+constexpr|static|constexpr|virtual|explicit|inline|friend|extern|thread_local|mutable|noescape)\s+)*[A-Za-z_][A-Za-z0-9_:<>,&*\s]*?)\s+(?:(?<qual>[A-Za-z_][A-Za-z0-9_]*)::)*(?<name>[A-Za-z_~][A-Za-z0-9_]*)$/;
 const RE_TAIL = /^(?:\s*(?:const|override|final|noexcept|volatile|\[\[.*?\]\]|=\s*0))*[^(){}]*\{?\s*$/;
@@ -312,7 +321,7 @@ export function scanText(text: string, file: string, module: string, scope: Symb
 			}
 		}
 
-		const fn = detectFunction(t, /\.(cpp|cc|cxx|c|mm)$/i.test(file));
+		const fn = detectFunction(t, /\.(cpp|cc|cxx|c|mm)$/i.test(file), innerType() !== "");
 		if (fn) {
 			const qualified = /([A-Za-z_][A-Za-z0-9_]*)::\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(t);
 			emit(qualified?.[1] && qualified[2] === fn.name ? `${qualified[1]}:${fn.name}` : fn.name, "function", line, fn.marker);
@@ -329,11 +338,11 @@ export function scanText(text: string, file: string, module: string, scope: Symb
 }
 
 /** See RE_HEAD/RE_TAIL. Returns the callee name and a `def|decl [qualifiers]` marker. */
-function detectFunction(line: string, isSource: boolean): { name: string; marker: string } | undefined {
+function detectFunction(line: string, isSource: boolean, insideType = false): { name: string; marker: string } | undefined {
 	const open = line.indexOf("(");
 	if (open < 3) return undefined;
 	const head = line.slice(0, open).trimEnd();
-	if (!head || head.includes("=") || head.includes("{") || head.includes(")") || head.includes("~")) return undefined;
+	if (!head || head.includes("=") || head.includes("{") || head.includes(")")) return undefined;
 	if (NOT_A_FUNCTION.test(line) || line.startsWith("#") || line.startsWith("@")) return undefined;
 	if (line.includes("= delete") || line.includes("= default")) return undefined;
 
@@ -352,10 +361,20 @@ function detectFunction(line: string, isSource: boolean): { name: string; marker
 	if (!groups.type || !groups.type.trim()) return undefined;
 	if (!name || FUNCTION_NAME_BLACKLIST.has(name)) return undefined;
 	if (name.startsWith("operator")) return undefined;
+	// `~` is legal only as the destructor's first character (`virtual ~AActor()`), never as a
+	// template operator or a stray token in the return type.
+	if (head.includes("~") && !name.startsWith("~")) return undefined;
+	// `Type Name(args);` in a source file declares a local, not a function: `FScopeLock Lock(&Cs);`,
+	// `UE::TReadScopeLock _(Lock);`, `TPropertyCombinationSet<64> CopyConstructed(Set);`. The
+	// discriminator is the qualifier chain right before the name (`void AFoo::Bar()`), not any `::`
+	// in the line — `UE::TReadScopeLock _` carries one in its *type*. Inside a type body the row is a
+	// member declaration and stays, so a class defined in a .cpp keeps its members.
+	if (isSource && !insideType && /;\s*$/.test(tail) && !groups.qual) return undefined;
 
 	const qualifiers: string[] = tail.match(/const|override|noexcept|final|=\s*0/g) ?? [];
-	if (/=\s*0/.test(tail)) qualifiers.push("pure virtual");
-	const marker = [isSource ? "def" : "decl", ...qualifiers.map((q) => (q.includes("0") ? "pure virtual" : q))].filter(Boolean).join(" ");
+	// `= 0` is one qualifier with one name; pushing it separately produced `decl pure virtual pure virtual`.
+	const named = qualifiers.map((q) => (/^=\s*0$/.test(q.trim()) ? "pure virtual" : q.trim()));
+	const marker = [isSource ? "def" : "decl", ...named].filter(Boolean).join(" ");
 	return { name, marker };
 }
 
