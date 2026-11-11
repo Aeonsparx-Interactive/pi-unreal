@@ -26,5 +26,7 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  // `tmp/` is scratch space (gitignored): live-capture probes and parity scripts are run, not compiled.
+  "exclude": ["node_modules", "tmp"]
 }

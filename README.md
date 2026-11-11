@@ -57,6 +57,7 @@ project?", "Where is `FLpMovementDirectionThresholds` defined?", "What do I need
 | `unreal_symbol_list` | "What does this project define?" Names by prefix — `ULp`, `ANiMy`, `UAnim` |
 | `unreal_context` | "What does this file/module include, define, and depend on?" Include paths, dependency lists, the real `WITH_*` defines; for a module, also whether the target's module graph contains it and how the `.uproject` treats its plugin |
 | `unreal_index` | Builds and reports the source index, the path-only **header index** ("does this header exist in this engine version?"), the clangd compile database, a **clangd health probe**, targeted re-scans (`patch`), and cache reclaim (`status` / `prune`) |
+| `unreal_mcp` | "What is this editor tool called, and what arguments does it take?" The running editor's MCP toolsets as a local catalog — exact tool names, required flags, defaults, the ready-to-send `call_tool` shape, read-only inspection recipes for Blueprints, and the Python source line behind a toolset |
 
 A lookup returns the declaration line's own text under each hit, so the usual follow-up (`read` at
 `file:line`) is only needed when the surrounding context matters.
@@ -77,6 +78,56 @@ facts from UnrealBuildTool Query, is the part of this package that stays useful 
 | `/unreal-symbol <symbol>` | Definition lookup, project + plugins, then engine if an engine index exists |
 | `/unreal-module <Module>` | Module directory, public/private dependency lists, defines file, C++ standard, SDK |
 | `/unreal-cache stats\|clear` | Inspect or clear the cached indexes |
+| `/unreal-mcp [status\|sync]` | Editor toolset catalog health; `sync` re-reads the running editor's schemas, `discover` indexes every mounted toolset |
+
+**Blueprint questions go through the editor, not the file.** A `.uasset`/`.umap` is not a readable
+document — the serialized bytes are garbled and do not reconstruct graphs, pins or defaults, so
+reading them as text produces confident nonsense. `unreal_mcp` answers the two things that make the
+editor path usable without a 72 KB schema dump: which tool exists (`describe`) and in what order the
+read-only ones are called (`recipe`). Example — `unreal_mcp` `action: "recipe"`, `recipe:
+"blueprint-inspect"`, `asset: "/Game/Blueprints/BP_Foo"`:
+
+```text
+[snapshot · 2m old · editor reachable · 97 tools]
+recipe blueprint-inspect
+  given: asset=/Game/Blueprints/BP_Foo
+
+1. AssetTools.load_asset   Loads an asset from the project.
+   call: call_tool({"toolset_name":"editor_toolset.toolsets.asset.AssetTools","tool_name":"load_asset","arguments":{"asset_path":"/Game/Blueprints/BP_Foo"}})
+   why: Every BlueprintTools call takes a loaded object reference, not an asset path string.
+...
+3. BlueprintTools.list_graphs   Lists all graphs in the Blueprint.
+   call: call_tool({"toolset_name":"editor_toolset.toolsets.blueprint.BlueprintTools","tool_name":"list_graphs","arguments":{"blueprint":"<result of step 1>"}})
+```
+
+The source line is part of the answer: `live` (schemas just read from the editor), `snapshot` (cached,
+editor down — names and arguments are still right, calls are not), or "no catalog" (start the editor,
+then `/unreal-mcp sync`; the agent is told to stop rather than guess).
+
+**Four toolsets indexed by default; fifty-two mounted.** A stock 5.8 editor exposes 52 toolsets / 830
+tools. `action: "discover"` describes all of them in one session (≈0.6 s, 1.1 MB) and persists the lot,
+so nothing is "not in catalog" just because it fell outside the default four:
+
+```text
+[discover · 0s old · editor reachable · 52 toolsets · 830 tools · 566 ms]
+top toolsets: SequencerTools 140, SequencerControlRigTools 72, BlueprintTools 53, ControlRigTools 44
+```
+
+**And the Python behind a tool.** Every toolset plugin ships its toolsets as Python (`class
+BlueprintTools(unreal.ToolsetDefinition)` + `@toolset_registry.tool_call`). `action: "python"` indexes
+that tree offline — 29 classes / 596 tools in ≈0.2 s — and answers with `file:line` plus the real `def`
+signature, cross-checked against what this editor actually mounts:
+
+```text
+python toolset: "BlueprintTools"
+  BlueprintTools  (EditorToolset)  …/EditorToolset/Content/Python/editor_toolset/toolsets/blueprint.py:172
+    def read_graph_dsl(graph: unreal.EdGraph) -> str:   line 187
+```
+
+`python` with no selector reports the parity: how many mounted toolsets have a Python class, which are
+C++-registered (`EditorAppToolset`, `LogsToolset`, …), and which ship in this engine but are not mounted
+because their plugin is disabled for this project. Argument truth stays with the live schema — the scan
+answers *where the tool is implemented and what it is called*, never *what it takes*.
 
 Example — `/unreal`:
 

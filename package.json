@@ -1,6 +1,6 @@
 {
   "name": "@aeonsparx/pi-unreal",
-  "version": "1.3.0",
+  "version": "1.5.0",
   "description": "Read-only Pi extension that resolves Unreal Engine associations and project/plugin descriptors from engine-authored schemas instead of guesswork.",
   "type": "module",
   "license": "MIT",

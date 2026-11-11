@@ -15,6 +15,10 @@ import { Type } from "typebox";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 
 import { normalizePath, realFs, truncateLines, type JsonValue } from "./util.ts";
+import { allTools, callSkeleton, describeToolText, ensureCatalog, listText, pickToolset, searchTools, statusText, SNAPSHOT_TTL_MS, V1_TOOLSETS, ageLabel } from "./mcp-catalog.ts";
+import { listToolsetsLive } from "./mcp-live.ts";
+import { RECIPES, recipeIndexText, renderRecipe } from "./mcp-recipes.ts";
+import { findPyTool, findPyToolset, pyIndexAgeMs, pyIndexSummary, pyToolsetText, reconcileWithLive, resolvePyIndex } from "./toolset-scan.ts";
 import { buildContext, callSitesReport, clangdHealthReport, compileDbReport, fileContext, headerReport, indexBuild, indexStatus, patchReport, pruneReport, symbolList, symbolLookup, type Scope } from "./tools.ts";
 
 /* ──────────────────────────────────────────────────────────────────────────── schemas */
@@ -101,6 +105,8 @@ const IndexParams = Type.Object({
 /* ──────────────────────────────────────────────────────────────────────────── rendering */
 
 const jsonOf = (value: unknown): JsonValue => JSON.parse(JSON.stringify(value ?? null)) as JsonValue;
+
+const truncate = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
 const shortPath = (file: string | undefined, cwd: string) => {
 	if (!file) return "?";
@@ -491,7 +497,289 @@ export const unrealIndex = defineTool({
 	},
 });
 
-export const indexTools = [unrealSymbol, unrealSymbolList, unrealContext, unrealIndex];
+/* ────────────────────────────────────────────────────────────────────────── unreal_mcp */
+
+const McpParams = Type.Object({
+	action: Type.Optional(
+		Type.Union([Type.Literal("list"), Type.Literal("search"), Type.Literal("describe"), Type.Literal("recipe"), Type.Literal("sync"), Type.Literal("discover"), Type.Literal("python"), Type.Literal("status")], {
+			description: "list (toolsets, or one toolset's tools) | search (name/args/doc substring) | describe (exact args + call_tool shape) | recipe (verified read-only ladder) | sync (force a live refresh of the indexed toolsets) | discover (index EVERY toolset this editor mounts: one list_toolsets + one describe each, ~1 MB, seconds) | python (the toolset plugins' Python source: tool signatures as written, file:line, and which toolsets exist in this engine but are not mounted here) | status. Inferred from the other parameters when omitted.",
+		}),
+	),
+	query: Type.Optional(Type.String({ description: "search: words to match against tool names, toolset names, argument names and doc text." })),
+	toolset: Type.Optional(Type.String({ description: "Toolset short name ('BlueprintTools') or full name ('editor_toolset.toolsets.blueprint.BlueprintTools')." })),
+	tool: Type.Optional(Type.String({ description: "Tool short name ('get_parent') or qualified ('BlueprintTools.get_parent'). Accepts a fully prefixed name too." })),
+	recipe: Type.Optional(Type.String({ description: `Read-only inspection ladder: ${Object.keys(RECIPES).join(" | ")}.` })),
+	asset: Type.Optional(Type.String({ description: "recipe: asset path, e.g. '/Game/Blueprints/BP_Foo' (the object path as the editor reports it, no extension)." })),
+	entry: Type.Optional(Type.String({ description: "recipe blueprint-behaviour: node title substring to start from, e.g. 'BeginPlay'." })),
+	limit: Type.Optional(Type.Number({ description: "search: maximum hits. Default 12." })),
+	refresh: Type.Optional(Type.Boolean({ description: "Re-describe the toolsets from the running editor even if the cached snapshot is still fresh." })),
+	url: Type.Optional(Type.String({ description: "Editor MCP endpoint. Default $PI_UNREAL_MCP_URL or http://127.0.0.1:8000/mcp." })),
+	cwd: CwdSchema,
+});
+
+const McpOut = Type.Object({
+	action: Type.String(),
+	source: Type.String(),
+	editorReachable: Type.Boolean(),
+	tools: Type.Optional(Type.Number()),
+	missing: Type.Optional(Strings),
+	notes: Type.Optional(Strings),
+	catalog: Loose,
+});
+
+/**
+ * `unreal_mcp` — the editor's tool surface as data instead of guesswork.
+ *
+ * One lookup answers "what is this tool called and what arguments does it take", which is the whole
+ * cost of the blueprint gap: the live `describe_toolset` payload for BlueprintTools is ~72 KB on a
+ * single line and is truncated by the adapter, so the model never sees the schema it must obey.
+ */
+export const unrealMcp = defineTool({
+	name: "unreal_mcp",
+	label: "UE MCP catalog",
+	description: "Look up the tools a running Unreal editor exposes over Epic's Unreal MCP — default Blueprint/Object/Actor/Asset, or every mounted toolset with action 'discover' — with exact argument names, required flags, defaults, the `unreal.*` Python type of each object reference, and the `call_tool` shape. Uses the live editor when reachable, otherwise the local snapshot; never calls a toolset itself.",
+	promptSnippet: "Resolve an Unreal MCP tool name and its arguments before calling it (any toolset)",
+	promptGuidelines: [
+		"Call unreal_mcp before any editor toolset call: 'describe' returns the exact toolset_name, tool_name and arguments, so a name is never reconstructed from memory.",
+		"For Blueprint work start with action 'recipe' recipe 'blueprint-inspect' — it is the verified read-only order (load_asset, get_parent, list_graphs, list_functions/events/variables, get_default_object, list_properties, read_graph_dsl) and names the dead ends.",
+		"A snapshot answer is not a live answer: check the source line. 'source: snapshot' after the editor restarted can be stale — pass refresh: true (or run /unreal-mcp sync) when the tool surface may have changed.",
+		"Never read a .uasset/.umap as text to answer an asset question: the bytes are garbled and incomplete, and the editor's loaded object is the only real decode.",
+		"A 'not in catalog' answer means the toolset is not mounted in this project or is outside the indexed set: pass action 'discover' to index all 52 mounted toolsets (~830 tools) before concluding a tool does not exist, then report the absence instead of inventing the call.",
+		"Object-reference arguments are `{ refPath: '</Script/Engine.Blueprint>' }`, not the Python type: describe prints the `unreal.*` name so engine types map both ways, but the argument value is always the refPath string.",
+	],
+	parameters: McpParams,
+	outputSchema: McpOut,
+	annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+	executionMode: "sequential",
+
+	async execute(_id, params, _signal, _update, ctx) {
+		const cwd = params.cwd ?? ctx.cwd;
+		const action = params.action ?? (params.recipe ? "recipe" : params.tool ? "describe" : params.query ? "search" : "list");
+		const ensured = await ensureCatalog({
+			cwd,
+			url: params.url,
+			refresh: params.refresh === true || action === "sync",
+			discoverAll: action === "discover",
+			extraToolsets: params.toolset ? [params.toolset] : undefined,
+		});
+		const snapshot = ensured.snapshot;
+		const out = {
+			action,
+			source: ensured.source,
+			editorReachable: ensured.reachable,
+			tools: snapshot ? allTools(snapshot).length : 0,
+			missing: [] as string[],
+			notes: [...ensured.notes, ...ensured.failures.map((failure) => `${failure.name}: ${truncate(failure.error, 400)}`)],
+			catalog: { key: ensured.ctx.key, url: ensured.ctx.url, ageMs: ensured.ageMs ?? 0, toolsets: snapshot ? Object.keys(snapshot.toolsets) : [] },
+		};
+
+		if (action === "status") return result(statusText(ensured, snapshot), out);
+
+		if (!snapshot) {
+			const text = [
+				`No Unreal MCP catalog: ${ensured.reachable ? "the editor is listening but returned no toolset schemas" : `nothing is listening at ${ensured.ctx.url}`}.`,
+				"This is a stop condition, not a reason to guess tool names.",
+				"Start the editor (the ModelContextProtocol plugin starts automatically), then run /unreal-mcp sync (or unreal_mcp action 'sync').",
+				`Indexed toolsets: ${V1_TOOLSETS.map((name) => name.slice(name.lastIndexOf(".") + 1)).join(", ")} (action 'discover' indexes everything the editor mounts).`,
+				...out.notes.map((note) => `· ${note}`),
+			].join("\n");
+			return result(text, out, true);
+		}
+
+		const sourceLine = `[${ensured.source}${ensured.ageMs ? ` · ${ageLabel(ensured.ageMs)} old` : ""} · editor ${ensured.reachable ? "reachable" : "not reachable"} · ${out.tools} tools]`;
+
+		if (action === "python") {
+			const resolution = await resolvePyIndex({ cwd, refresh: params.refresh === true });
+			const pyIndex = resolution.index;
+			if (!pyIndex) {
+				return result(
+					[
+						"No Python toolset index: no engine or project plugins were resolvable from this working directory.",
+						...resolution.notes.map((note) => `· ${note}`),
+						"Point cwd at the project, or use action 'list' for the live catalog instead.",
+					].join("\n"),
+					{ ...out, action: "python", source: "none" },
+					true,
+				);
+			}
+			const pyOut = {
+				...out,
+				action: "python",
+				source: resolution.source === "built" ? "live" : "snapshot",
+				catalog: { ...out.catalog, key: pyIndex.key, ageMs: pyIndexAgeMs(pyIndex), toolsets: pyIndex.toolsets.map((toolset) => toolset.plugin) },
+			};
+			const head = `[python index · ${resolution.source === "built" ? "rebuilt" : `${ageLabel(pyIndexAgeMs(pyIndex))} old`} · ${pyIndexSummary(pyIndex)}${resolution.engineRoot ? ` · ${resolution.engineRoot}` : ""}]`;
+
+			if (params.tool) {
+				const hits = findPyTool(pyIndex, params.tool);
+				if (!hits.length) {
+					const near = findPyToolset(pyIndex, params.tool);
+					const hint = near
+						? `Toolset '${near.className}' exists at ${normalizePath(near.file)}:${near.line} — action 'python' toolset '${near.className}' lists its tools.`
+						: "Search the live catalog with action 'search' for a word from the tool's purpose.";
+					return result([`${head}  no Python tool named '${params.tool}'`, hint].join("\n"), pyOut, true);
+				}
+				const liveShortsByToolset = new Map<string, Set<string>>();
+				for (const toolset of Object.values(snapshot?.toolsets ?? {})) liveShortsByToolset.set(toolset.name.toLowerCase(), new Set(toolset.tools.map((tool) => tool.short.toLowerCase())));
+				const lines = [`${head}  ${hits.length} definition(s) of '${params.tool}'`];
+				for (const hit of hits.slice(0, 6)) {
+					const liveShorts = liveShortsByToolset.get(hit.toolset.name.toLowerCase());
+					const mounted = liveShorts ? (liveShorts.has(hit.tool.name.toLowerCase()) ? "  mounted" : "  not in this editor's schema") : "";
+					lines.push(`  ${hit.toolset.className}.${hit.tool.name}${mounted}`, `    ${hit.tool.signature}`, `    ${normalizePath(hit.toolset.file)}:${hit.tool.line}`);
+					if (hit.tool.summary) lines.push(`    ${hit.tool.summary}`);
+				}
+				if (hits.length > 6) lines.push(`  … ${hits.length - 6} more hit(s) with the same name`);
+				return result(lines.join("\n"), pyOut);
+			}
+
+			if (params.toolset) {
+				const found = findPyToolset(pyIndex, params.toolset);
+				if (!found) {
+					return result(
+						[
+							`${head}  no Python toolset '${params.toolset}'`,
+							`Known classes: ${pyIndex.toolsets.map((toolset) => toolset.className).join(", ")}`,
+							"A C++-registered toolset has no Python class — action 'list' covers those.",
+						].join("\n"),
+						pyOut,
+						true,
+					);
+				}
+				return result([head, pyToolsetText(found)].join("\n"), pyOut);
+			}
+
+			// No selector: the engine-wide picture, reconciled against what this editor actually mounts.
+			// The mounted list comes from `list_toolsets` when the editor answers — a narrow local catalog
+			// must never be read as "this plugin is disabled", which is the claim this block makes.
+			let mountedNames: string[] = [];
+			let mountedScope = "local catalog snapshot (may be partial — action 'discover' widens it)";
+			if (ensured.reachable) {
+				const listed = await listToolsetsLive(ensured.ctx.url);
+				const names = listed.value?.entries.map((entry) => entry.name) ?? [];
+				if (names.length) {
+					mountedNames = names;
+					mountedScope = "live list_toolsets";
+				}
+			}
+			if (!mountedNames.length) mountedNames = Object.values(snapshot?.toolsets ?? {}).map((toolset) => toolset.name);
+			const toolsByToolset = new Map<string, string[]>();
+			for (const toolset of Object.values(snapshot?.toolsets ?? {})) toolsByToolset.set(toolset.name.toLowerCase(), toolset.tools.map((tool) => tool.short));
+			const mounted = mountedNames.map((name) => ({ name, tools: toolsByToolset.get(name.toLowerCase()) }));
+			const parity = reconcileWithLive(pyIndex, mounted);
+			const lines = [head, `  mounted-toolset source: ${mountedScope}`];
+			if (mounted.length) {
+				lines.push(`  mounted by this editor: ${mounted.length} toolset(s) — ${parity.matched.length} also have a Python class, ${parity.mountedOnly.length} are C++-registered`);
+				const drift = parity.matched.filter((entry) => entry.missingTools.length);
+				if (drift.length) lines.push(`  Python tools the live schema does not list: ${drift.map((entry) => `${entry.toolset.className}(${entry.missingTools.join(",")})`).join(", ")}`);
+			}
+			if (parity.onDiskOnly.length) {
+				lines.push("", "  in this engine's plugins but NOT mounted here (plugin not enabled for this project — the tool cannot be called):");
+				for (const toolset of parity.onDiskOnly) {
+					const rel = toolset.file.slice(toolset.file.indexOf("/Content/Python/") + 1);
+					lines.push(`    ${toolset.className.padEnd(28)} ${toolset.plugin}/${rel}  ${toolset.tools.length} tools`);
+				}
+			}
+			lines.push("", "  toolsets with a Python class:", ...pyIndex.toolsets.map((toolset) => `    ${toolset.className.padEnd(28)} ${String(toolset.tools.length).padStart(3)} tools  ${toolset.plugin}`));
+			lines.push("", "Signatures here are Python source (types as written); the callable schema is the live one — action 'describe'.", "Narrow with action 'python' toolset '<Class>' or tool '<name>'.");
+			if (out.notes.length) lines.push("", ...out.notes.map((note) => `· ${note}`));
+			return result(lines.join("\n"), pyOut);
+		}
+		if (action === "sync" || action === "discover") {
+			const head = action === "discover" ? `${sourceLine} catalog discovered from ${ensured.ctx.url}` : `${sourceLine} catalog synced from ${ensured.ctx.url}`;
+			const lines = [head, listText(snapshot), ...out.notes.map((note) => `· ${note}`)];
+		}
+
+		if (action === "list") {
+			if (!params.toolset) return result([sourceLine, listText(snapshot), ...out.notes.map((note) => `· ${note}`)].join("\n"), out);
+			const toolset = pickToolset(snapshot, params.toolset);
+			if (!toolset) {
+				out.missing.push(params.toolset);
+				return result([`${sourceLine}  ${params.toolset}: not in catalog`, ...Object.values(snapshot.toolsets).map((entry) => `  ${entry.short}  ${entry.tools.length} tools`), ...out.notes.map((note) => `· ${note}`)].join("\n"), out, true);
+			}
+			const lines = [`${sourceLine}  ${toolset.name}`, ...toolset.tools.map((tool) => `  ${tool.short.padEnd(32)} ${tool.summary}`)];
+			return result(lines.join("\n"), out);
+		}
+
+		if (action === "search") {
+			const matches = searchTools(snapshot, params.query ?? "", params.limit ?? 12);
+			if (!matches.length) {
+				return result([`${sourceLine}  no tool matches '${params.query ?? ""}' in ${Object.keys(snapshot.toolsets).join(", ")}`, "Try a shorter word, or action 'list' toolset '<name>' to see the tool names."].join("\n"), out, true);
+			}
+			const lines = [`${sourceLine}  ${matches.length} match(es) for '${params.query}'`, ...matches.map((match) => `  ${`${match.tool.toolsetShort}.${match.tool.short}`.padEnd(38)} ${match.tool.summary}`)];
+			return result(lines.join("\n"), out);
+		}
+
+		if (action === "describe") {
+			if (!params.tool) return result(`${sourceLine}  describe needs tool: '<name>' (search first when unsure)`, out, true);
+			const wanted = params.tool.trim();
+			const bare = wanted.includes(".") ? wanted.slice(wanted.lastIndexOf(".") + 1) : wanted;
+			const qualifiedToolset = wanted.includes(".") ? wanted.slice(0, wanted.lastIndexOf(".")) : undefined;
+			const candidates = allTools(snapshot).filter((tool) => tool.short.toLowerCase() === bare.toLowerCase() && (!qualifiedToolset || tool.toolsetShort.toLowerCase() === qualifiedToolset.toLowerCase() || tool.toolset.toLowerCase() === qualifiedToolset.toLowerCase()));
+			const filtered = params.toolset ? candidates.filter((tool) => tool.toolsetShort.toLowerCase() === params.toolset!.toLowerCase()) : candidates;
+			const tool = filtered[0] ?? searchTools(snapshot, bare, 1)[0]?.tool;
+			if (!tool) {
+				out.missing.push(wanted);
+				const near = searchTools(snapshot, bare, 5).map((match) => `${match.tool.toolsetShort}.${match.tool.short}`);
+				return result([`${sourceLine}  '${wanted}' is not a tool in ${Object.keys(snapshot.toolsets).join(", ")}`, near.length ? `Closest: ${near.join(", ")}` : "No close match — action 'search' with a word from the tool's purpose."].join("\n"), out, true);
+			}
+			const lines = [sourceLine, describeToolText(tool), `  call: call_tool(${callSkeleton(tool)})`];
+			if (filtered.length > 1) lines.push(`  also found in: ${filtered.slice(1).map((entry) => entry.toolsetShort).join(", ")} — pass toolset to disambiguate`);
+			return result(lines.join("\n"), out);
+		}
+
+		// recipe
+		const recipeName = params.recipe ?? "blueprint-inspect";
+		const recipe = RECIPES[recipeName];
+		if (!recipe) {
+			out.missing.push(recipeName);
+			return result([`${sourceLine}  unknown recipe '${recipeName}'`, recipeIndexText()].join("\n"), out, true);
+		}
+		const values: Record<string, string> = {};
+		if (params.asset) values.asset = params.asset;
+		if (params.entry) values.entry = params.entry;
+		const rendered = renderRecipe(recipe, snapshot, values);
+		out.missing.push(...rendered.missing);
+		const lines = [sourceLine, rendered.text];
+		if (rendered.missing.length) lines.push("", `! not in catalog (toolset not mounted here, or outside the indexed set): ${rendered.missing.join(", ")}`);
+		if (out.notes.length) lines.push("", ...out.notes.map((note) => `· ${note}`));
+		return result(lines.join("\n"), out, rendered.missing.length > 0);
+	},
+});
+
+export const indexTools = [unrealSymbol, unrealSymbolList, unrealContext, unrealIndex, unrealMcp];
+
+/** `/unreal-mcp [status|sync|discover]` — health, a forced refresh of the indexed toolsets, or a full discovery of everything the editor mounts. */
+export async function unrealMcpCommand(arg: string, cwd: string): Promise<string> {
+	const requested = arg.trim();
+	if (requested === "python") {
+		const resolved = await resolvePyIndex({ cwd });
+		const index = resolved.index;
+		if (!index) return `unreal_mcp python: no index (${resolved.notes.join(" | ") || "no engine found"}).`;
+		const rows = index.toolsets
+			.slice(0, 40)
+			.map((toolset) => `  ${toolset.className.padEnd(30)} ${String(toolset.tools.length).padStart(3)} tools  ${toolset.plugin}`);
+		return [`${resolved.source === "cache" ? "cached" : "scanned"} · ${pyIndexSummary(index)}`, ...rows].join("\n");
+	}
+	const action = requested === "sync" || requested === "discover" ? requested : "status";
+	const ensured = await ensureCatalog({ cwd, refresh: action === "sync", discoverAll: action === "discover" });
+	try {
+		const snapshot = ensured.snapshot;
+		if (action === "sync") {
+			if (!snapshot) return `unreal_mcp sync failed: ${ensured.notes.join(" | ") || "no editor MCP reachable"}. Start the editor and retry.`;
+			return [`catalog synced from ${ensured.ctx.url} (${allTools(snapshot).length} tools, ttl ${Math.round(SNAPSHOT_TTL_MS / 60000)}m)`, listText(snapshot)].join("\n");
+		}
+		if (action === "discover") {
+			if (!snapshot) return `unreal_mcp discover failed: ${ensured.notes.join(" | ") || "no editor MCP reachable"}. Start the editor and retry.`;
+			const rows = Object.values(snapshot.toolsets)
+				.slice(0, 40)
+				.map((toolset) => `  ${toolset.short.padEnd(34)} ${String(toolset.tools.length).padStart(3)} tools`);
+			return [`catalog discovered from ${ensured.ctx.url}: ${Object.keys(snapshot.toolsets).length} toolsets, ${allTools(snapshot).length} tools`, ...rows].join("\n");
+		}
+		return statusText(ensured, snapshot);
+	} finally {
+		/* nothing to clean up: the snapshot is the state */
+	}
+}
 
 /** `/unreal-symbol <name>` — prefix-tolerant lookup across project and engine indexes. */
 export function unrealSymbolCommand(query: string, cwd: string) {

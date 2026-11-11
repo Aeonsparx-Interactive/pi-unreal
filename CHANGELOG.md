@@ -10,6 +10,83 @@ a renamed parameter, or answer text an existing consumer parses.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-11
+
+`unreal_mcp` covered four toolsets out of the 52 a real editor mounts, and stopped at the tool name —
+when the name was wrong or the toolset was missing, the next step was still a guess. This release makes
+the catalog complete and adds the offline half of the answer: where the tool is implemented.
+
+### Added
+
+- `unreal_mcp action="discover"` — `list_toolsets` → `describe_toolset` for **every** mounted toolset in
+  one session and persists it (measured: 52 toolsets / 830 tools / 566 ms / 1.15 MB / 0 failures). A
+  15-minute refresh now re-describes `wanted ∪ cached toolsets`, so a discovered catalog is not pruned
+  back to the default four.
+- `unreal_mcp action="python"` — indexes the toolsets' own Python (`<Plugin>/Content/Python/**`,
+  `class X(unreal.ToolsetDefinition)` + `@toolset_registry.tool_call`) into 29 toolset classes / 596 tools
+  in ≈0.2 s warm (1.6 s cold), cached 24 h. Answers with `file:line` and the real `def` signature, so
+  "read the implementation" becomes a direct `read` instead of a search.
+- Parity report (`action="python"`, no selector): mounted toolsets split into those with a Python class,
+  those registered in C++ only (`EditorAppToolset`, `LogsToolset`, …), and those shipping in this engine
+  but unmounted because their plugin is disabled for the project.
+- `pythonTypeFor` and a wider `describe` line: UObject arguments now render as
+  `object ref → unreal.EdGraph  (/Script/Engine.EdGraph)` — the Python name an agent recalls next to the
+  `refPath` string the call must actually contain.
+- `skills/ue-blueprint-inspection`: "when a tool is not in the catalog" ladder (search → python → the
+  three outcomes), and the read-only boundary restated for the wider catalog.
+
+### Fixed
+
+- `parseToolsetList` no longer invents toolsets from markdown bullets inside descriptions
+  (`- Enum value lookups` became a toolset called `Enum`); a line is a toolset only with a colon and a
+  dotted name. Continuation lines now fold into the previous description.
+- "in this engine but not mounted" was computed from a four-toolset snapshot, so 18 toolsets that the
+  editor does mount were reported as disabled. The mounted set now comes from live `list_toolsets`.
+- `python tool=<name>` applied the first hit's toolset to every hit when marking what is mounted.
+- `describeToolText` no longer fabricates placeholders for optional object arguments (that fix landed
+  here after the 1.4.0 note; skeletons carry required arguments only).
+
+## [1.4.0] - 2026-11-10
+
+The blueprint gap: an asset question had no honest route. Reading `.uasset` bytes is not a decode
+(the output is garbled and does not reconstruct graphs, pins or defaults), and the only real answer —
+Epic's Unreal MCP toolsets inside the editor — costs a guess per call because the tool names are
+runtime-registered Python and the live `describe_toolset` payload for BlueprintTools is ~72 KB on a
+single line, past the MCP adapter's text guard. This release turns that surface into a local,
+queryable catalog and encodes the read-only order that field sessions settled on.
+
+### Added
+
+- **`unreal_mcp`** — the running editor's toolset catalog, live-first: `action: "list"` (toolsets, or
+  one toolset's tools), `"search"` (name/args/doc substring), `"describe"` (exact arguments, required
+  flags, defaults, the `call_tool` shape), `"recipe"` (read-only inspection ladder), `"sync"` (force a
+  live refresh), `"status"`. Answers start with a source line — `live`, `snapshot · <age> old`, or an
+  explicit "no catalog" that tells the agent to stop instead of inventing a name. Measured cost for
+  the `read_graph_dsl` describe: **326 bytes** against the 72,168-byte full dump, with 0 differences
+  across 97 tools when the normalized catalog was compared against the captured payloads
+  (`lib/mcp-catalog.ts`, `lib/mcp-live.ts`, `lib/pi-tools.ts` `unrealMcp`).
+- **Read-only Blueprint recipes** — `blueprint-inspect` (load_asset → get_parent → list_graphs →
+  functions/events/variables → get_default_object → list_properties → get_properties →
+  read_graph_dsl), `blueprint-variables`, `blueprint-behaviour`. Each step names a toolset and tool, so
+  a renamed or unmounted tool is reported as `NOT IN CATALOG` instead of rendered as a plausible call;
+  each also carries the dead end it exists to prevent (`read_graph_dsl` needs a graph *object*,
+  `find_nodes` needs a title, `get_properties` needs names from `list_properties`). (`lib/mcp-recipes.ts`)
+- **`/unreal-mcp [status|sync]`** — catalog health, or a forced re-read of the editor's schemas.
+- **`ue-blueprint-inspection` skill** — the two rules (never read the asset file; resolve the tool
+  before calling it), the lookup ladder, the verified read order, and the scope of the indexed catalog.
+- The context card now names `unreal_mcp` and warns that a `.uasset`/`.umap` is not a readable document.
+- Endpoint override: `PI_UNREAL_MCP_URL` (default `http://127.0.0.1:8000/mcp`) and a per-call `url`
+  parameter, for editors started with a non-default `ModelContextProtocol.StartServer <port>`.
+
+### Notes
+
+- Scope is inspection only: no `create_*`/`set_*`/`write_graph_dsl`/`compile_blueprint`. Authoring and
+  the static Python toolset scan (`@toolset_registry.tool_call` across
+  `Engine/Plugins/Experimental/Toolsets/**/Content/Python`) are deliberately deferred until the read
+  path has been used in anger.
+- The snapshot lives under `~/.pi/agent/unreal-cache/mcp/<key>/` (15-minute TTL, re-described live
+  while the editor is reachable) and never contains Epic's schema dumps in the repository.
+
 ## [1.3.0] - 2026-11-10
 
 A correctness release driven by a review of the package against its own published claims: every

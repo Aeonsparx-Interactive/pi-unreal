@@ -386,14 +386,136 @@ Field names, host types, and loading phases are transcribed from the engine's se
 - `.uplugin` has no `Enabled` key; enablement is `EnabledByDefault` + the project reference.
 - `IsBetaVersion` is metadata in UE 5.8 (no engine/UBT beta gate exists).
 
+## Unreal MCP toolset catalog (`unreal_mcp`)
+
+Epic's UE 5.8 `ModelContextProtocol` plugin exposes exactly three meta-tools — `list_toolsets`,
+`describe_toolset`, `call_tool` — and every real capability is a `call_tool` naming a tool from a
+toolset registered by a plugin. The tool names are **not** engine API names: each toolset is a Python
+class (`editor_toolset/toolsets/blueprint.py:172 class BlueprintTools` → toolset
+`editor_toolset.toolsets.blueprint.BlueprintTools`) whose methods carry a `@toolset_registry.tool_call`
+decorator, and the wrapper renames them (`compile_blueprint`, `read_graph_dsl`,
+`get_connected_subgraph` have no 1:1 `unreal.BlueprintEditorLibrary` counterpart). Guessing a tool
+name therefore fails in the most expensive way: the call is well-formed and the name does not exist.
+
+The second half of the problem is size. `describe_toolset("…blueprint.BlueprintTools")` is **72,168
+bytes on one line** (53 tools, 102,568 pretty-printed). Anything above the adapter's 50 KB text guard
+is truncated, so the schema an agent needs to obey is exactly the one it cannot read.
+
+`extensions/unreal/lib/mcp-catalog.ts` normalizes that payload once into rows — toolset, bare tool
+name, summary, full doc, args (`object ref` for the engine's `{ refPath }` handle type, plus
+`refType`, `required`, `defaultValue`), return type — and persists it under
+`cacheDir()/mcp/<key>/snapshot.json` (+ `raw/<Short>.json` for re-normalization). Answers are
+fragments of a few hundred bytes: the `read_graph_dsl` entry is 326 bytes including its `call_tool`
+shape.
+
+### Authority model
+
+| editor | snapshot | answer |
+| --- | --- | --- |
+| reachable | fresh (< 15 min) and complete | answer from the snapshot, no 72 KB re-transfer |
+| reachable | missing / stale / `refresh` / a wanted toolset absent | `describe_toolset` live, persist, answer from the fresh snapshot |
+| unreachable | exists | answer from the snapshot, **say how old it is** |
+| unreachable | missing | `source: "none"` — the tool returns editor-start instructions and an error, not a guess |
+
+The probe is a TCP connect to the endpoint (`probeMcpEndpoint`, 1.5 s), not a full handshake: the
+answer "is the editor listening" must not cost a session. The handshake itself is streamable HTTP —
+POST `initialize` (`protocolVersion "2025-06-18"`), keep the `mcp-session-id` response header, POST
+`notifications/initialized`, then `tools/call`; responses come back as JSON or SSE (`data:` frames,
+the last JSON frame wins, `lib/mcp-live.ts` `parseRpcResponse`). One session serves a whole refresh.
+
+`extraToolsets` (surfaced as the tool's `toolset` parameter) widens `V1_TOOLSETS` for a single call:
+`action: "list"`, `toolset: "MaterialTools"`, `refresh: true` describes that toolset live, persists it,
+and lists it. Without a live editor the honest answer stays "not in catalog".
+
+### Discovering everything the editor mounts
+
+`V1_TOOLSETS` is four toolsets; a real editor mounts **52** on a stock 5.8 install (`AllToolsets`
+enabled) exposing **830** tools. `action: "discover"` (`ensureCatalog({discoverAll: true})`) walks
+`list_toolsets` → `describe_toolset` for every mounted toolset in one session and persists the lot:
+**566 ms, 1.15 MB, 0 failures** measured, versus 72 KB for `BlueprintTools` alone. A full refresh
+re-describes `wanted ∪ cached toolsets`, so discovering 52 does not get pruned back to four by the next
+15-minute refresh.
+
+One parse trap is worth naming: `list_toolsets` is markdown prose, and descriptions contain their own
+bullets (`- Enum value lookups`, `- General usage information`). A `^[-*]` line is only a toolset when
+it also carries a colon and a **dotted** name (`lib/mcp-live.ts` `parseToolsetList`); the naive version
+invented toolsets called `Enum`, `General`, `Runtime`, `FX`.
+
+### The Python side of the same catalog
+
+The toolset plugins ship their toolsets as Python under `<Plugin>/Content/Python/**`. That tree is a
+second, fully offline source of truth for **names and locations** — `@toolset_registry.tool_call` +
+`def name(...)` inside `class X(unreal.ToolsetDefinition)` — and `lib/toolset-scan.ts` indexes it:
+29 toolset classes and 596 tools across 7 plugins in 662 files, in **214 ms warm / 1.6 s cold**, cached
+24 h at `cacheDir()/mcp/python/<key>.json`. It pairs each toolset with `<file>:<line>` and the raw
+`def` signature, which is what makes "open the implementation and read it" a two-step job instead of a
+search:
+
+```
+python toolset:"BlueprintTools"  →  BlueprintTools  (EditorToolset)  …/blueprint.py:172
+                                     read_graph_dsl(graph: unreal.EdGraph) -> str   line 187
+```
+
+Deliberately **not** parsed: argument schemas. Multi-line `def` blocks, `X | None` annotations and
+default expressions make a hand-rolled parser plausible enough to be wrong, and the live
+`describe_toolset` already carries the schema. The scan answers *where*, the editor answers *what*.
+
+`reconcileWithLive` compares the scan against the mounted set and reports both directions:
+`onDiskOnly` (in this engine, plugin not enabled for this project — the tool cannot be called) and
+`mountedOnly` (C++-registered, no Python class: `EditorAppToolset`, `LogsToolset`,
+`SemanticSearchToolset`, `SlateInspectorToolset`, `WorldConditionsToolset`). When the mounted name is
+known but its tool list is not, no drift is claimed rather than declaring every tool missing. The
+ToolsetRegistry plugin's own test toolsets (`DemoPythonToolset`, `ErrorProneToolset`, under `tests/`)
+are skipped — they are never mounted.
+
+UObject arguments are rendered with both names: `object ref → unreal.EdGraph
+(/Script/Engine.EdGraph)`, because the Python annotation is what an agent recalls and the `refPath`
+string is what the call must contain (`pythonTypeFor`).
+
+Cache key: `shortHash(JSON.stringify({url, projectDir, engineAssociation}))` — a different editor
+endpoint or project is a different catalog, so a toolset list from one project never answers for
+another.
+
+### Recipes are data
+
+`lib/mcp-recipes.ts` holds the read-only ladders (`blueprint-inspect`, `blueprint-variables`,
+`blueprint-behaviour`) as `{toolset, tool, args, why, deadEnd?}` steps. Rendering resolves every step
+against the catalog: a step whose toolset is unmounted or whose tool moved is printed as
+`NOT IN CATALOG` and listed in `missing`, which is the whole point — the recipe cannot silently drift
+into a plausible-but-wrong call. `args` values are templates (`${asset}`, `${step1}`); step references
+render as `<result of step N>` because the handle is an engine object, not a string.
+
+`callSkeleton` emits the ready-to-send shape `{"toolset_name","tool_name","arguments"}`. Object
+references become `{ "refPath": "<…>" }`, required scalars get a type-appropriate placeholder, and
+**optional** args are omitted rather than fabricated — a `list_variables` skeleton has `blueprint`
+only, even though it also accepts an optional `graph`.
+
+### Deliberate scope
+
+Inspection only: no `create_*`, `set_*`, `write_graph_dsl`, `compile_blueprint`, `save_asset` — the
+catalog can name a mutating tool, but the package never calls one.
+
+The Python-side index exists for the *locator* question only (see above); C++-registered toolsets have
+no Python class, so the live editor remains the authority on what is callable. Python Developer Mode
+stub generation (`Intermediate/PythonStub`) is **off** on the reporting box — there is no stub tree to
+harvest, and the API documentation is versioned per engine release — so binding toolset arguments to
+`unreal.*` symbols stays out of scope; argument truth comes from the live `describe_toolset`.
+
 ## Known limits
 
+- `unreal_mcp` scope is inspection. `discover` indexes every mounted toolset, but `python` reads only
+  what ships as plugin Python; a toolset registered purely in C++ has no source location to point at.
 - Registry access needs `pwsh` (PowerShell 7). Without it, registry sources are unavailable and
   resolution relies on env, directory scans, and inline associations.
 - `unreal_resolve_engine` reports what the machine can prove. It does not install, register, or
   migrate engines, and never writes registry keys (the engine's `RegisterEngineInstallation`
   does; this package deliberately does not).
 - v1 is inspection only. `.ini` provenance is out of scope.
+- `unreal_mcp` describes and indexes toolsets; it never calls them. A toolset that is mounted but not
+  indexed is only reachable after a live `list`/`refresh` (see `extraToolsets`), and a *call* still
+  fails with the editor down even when the snapshot answers the name question.
+- The catalog is per endpoint + project. A snapshot from another project's editor lists that
+  project's mounted plugins; it is not evidence that the same toolset exists here.
 - The definition index is a scanner, not a parser: it finds declarations (`class`, `struct`,
   `enum`, `union`, `UFUNCTION`/`UPROPERTY`/`UCLASS`-marked members, delegates, aliases) and
   records `Owner:Member` qualified names. It does not resolve types, overloads, call sites, or
