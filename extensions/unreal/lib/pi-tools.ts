@@ -18,6 +18,7 @@ import { normalizePath, realFs, truncateLines, type JsonValue } from "./util.ts"
 import { allTools, callSkeleton, describeToolText, ensureCatalog, listText, pickToolset, searchTools, statusText, SNAPSHOT_TTL_MS, V1_TOOLSETS, ageLabel } from "./mcp-catalog.ts";
 import { listToolsetsLive } from "./mcp-live.ts";
 import { RECIPES, recipeIndexText, renderRecipe } from "./mcp-recipes.ts";
+import { DSL_FACTS, dslUsageSections, lintDsl, lintText, locateDslUsage } from "./dsl-grammar.ts";
 import { findPyTool, findPyToolset, pyIndexAgeMs, pyIndexSummary, pyToolsetText, reconcileWithLive, resolvePyIndex } from "./toolset-scan.ts";
 import { buildContext, callSitesReport, clangdHealthReport, compileDbReport, fileContext, headerReport, indexBuild, indexStatus, patchReport, pruneReport, symbolList, symbolLookup, type Scope } from "./tools.ts";
 
@@ -501,17 +502,20 @@ export const unrealIndex = defineTool({
 
 const McpParams = Type.Object({
 	action: Type.Optional(
-		Type.Union([Type.Literal("list"), Type.Literal("search"), Type.Literal("describe"), Type.Literal("recipe"), Type.Literal("sync"), Type.Literal("discover"), Type.Literal("python"), Type.Literal("status")], {
-			description: "list (toolsets, or one toolset's tools) | search (name/args/doc substring) | describe (exact args + call_tool shape) | recipe (verified read-only ladder) | sync (force a live refresh of the indexed toolsets) | discover (index EVERY toolset this editor mounts: one list_toolsets + one describe each, ~1 MB, seconds) | python (the toolset plugins' Python source: tool signatures as written, file:line, and which toolsets exist in this engine but are not mounted here) | status. Inferred from the other parameters when omitted.",
+		Type.Union([Type.Literal("list"), Type.Literal("search"), Type.Literal("describe"), Type.Literal("recipe"), Type.Literal("sync"), Type.Literal("discover"), Type.Literal("python"), Type.Literal("dsl"), Type.Literal("status")], {
+			description: "list (toolsets, or one toolset's tools) | search (name/args/doc substring) | describe (exact args + call_tool shape) | recipe (verified ladder; the authoring one is marked [write]) | sync (force a live refresh of the indexed toolsets) | discover (index EVERY toolset this editor mounts: one list_toolsets + one describe each, ~1 MB, seconds) | python (the toolset plugins' Python source: tool signatures as written, file:line, and which toolsets exist in this engine but are not mounted here) | dsl (the Blueprint graph DSL: grammar sections from the engine, or a pre-flight check of a script you are about to write) | status. Inferred from the other parameters when omitted.",
 		}),
 	),
 	query: Type.Optional(Type.String({ description: "search: words to match against tool names, toolset names, argument names and doc text." })),
 	toolset: Type.Optional(Type.String({ description: "Toolset short name ('BlueprintTools') or full name ('editor_toolset.toolsets.blueprint.BlueprintTools')." })),
 	tool: Type.Optional(Type.String({ description: "Tool short name ('get_parent') or qualified ('BlueprintTools.get_parent'). Accepts a fully prefixed name too." })),
-	recipe: Type.Optional(Type.String({ description: `Read-only inspection ladder: ${Object.keys(RECIPES).join(" | ")}.` })),
+	recipe: Type.Optional(Type.String({ description: `Verified ladder: ${Object.keys(RECIPES).join(" | ")}. 'blueprint-graph-author' is the authoring ladder — its write steps are emitted as call shapes, never executed here.` })),
+	code: Type.Optional(Type.String({ description: "dsl: a Blueprint graph DSL script to check before write_graph_dsl — reports the syntactic traps (unbalanced parens, unquoted paths, elif/else not last, mis-ordered exec continuations) without executing anything." })),
+	section: Type.Optional(Type.String({ description: "dsl: grammar section to print, e.g. 'NODE CALLS', 'STATEMENTS', 'MULTI-EXEC', 'EXPRESSIONS'. Absent = the section index." })),
 	asset: Type.Optional(Type.String({ description: "recipe: asset path, e.g. '/Game/Blueprints/BP_Foo' (the object path as the editor reports it, no extension)." })),
 	entry: Type.Optional(Type.String({ description: "recipe blueprint-behaviour: node title substring to start from, e.g. 'BeginPlay'." })),
 	limit: Type.Optional(Type.Number({ description: "search: maximum hits. Default 12." })),
+	full: Type.Optional(Type.Boolean({ description: "dsl: print the whole grammar instead of the section index (a tool result is line-limited, so prefer 'section')." })),
 	refresh: Type.Optional(Type.Boolean({ description: "Re-describe the toolsets from the running editor even if the cached snapshot is still fresh." })),
 	url: Type.Optional(Type.String({ description: "Editor MCP endpoint. Default $PI_UNREAL_MCP_URL or http://127.0.0.1:8000/mcp." })),
 	cwd: CwdSchema,
@@ -537,11 +541,13 @@ const McpOut = Type.Object({
 export const unrealMcp = defineTool({
 	name: "unreal_mcp",
 	label: "UE MCP catalog",
-	description: "Look up the tools a running Unreal editor exposes over Epic's Unreal MCP — default Blueprint/Object/Actor/Asset, or every mounted toolset with action 'discover' — with exact argument names, required flags, defaults, the `unreal.*` Python type of each object reference, and the `call_tool` shape. Uses the live editor when reachable, otherwise the local snapshot; never calls a toolset itself.",
+	description: "Look up the tools a running Unreal editor exposes over Epic's Unreal MCP — default Blueprint/Object/Actor/Asset, or every mounted toolset with action 'discover' — with exact argument names, required flags, defaults, the `unreal.*` Python type of each object reference, and the `call_tool` shape. Also serves the Blueprint graph DSL: the grammar as the engine ships it, and a pre-flight check of a script you are about to write. Uses the live editor when reachable, otherwise the local snapshot; never calls a toolset itself.",
 	promptSnippet: "Resolve an Unreal MCP tool name and its arguments before calling it (any toolset)",
 	promptGuidelines: [
 		"Call unreal_mcp before any editor toolset call: 'describe' returns the exact toolset_name, tool_name and arguments, so a name is never reconstructed from memory.",
 		"For Blueprint work start with action 'recipe' recipe 'blueprint-inspect' — it is the verified read-only order (load_asset, get_parent, list_graphs, list_functions/events/variables, get_default_object, list_properties, read_graph_dsl) and names the dead ends.",
+		"For graph authoring use recipe 'blueprint-graph-author'. It is marked [write]: the package emits the call shapes, the caller runs them. Never call write_graph_dsl/save_assets from this package, and never skip the read_graph_dsl capture that precedes the write.",
+		"Before write_graph_dsl, check the script with action 'dsl' code '<DSL>', and read the grammar with action 'dsl' section '<NAME>' instead of reconstructing syntax from memory — the write compiles the Blueprint, so a malformed script is not a no-op.",
 		"A snapshot answer is not a live answer: check the source line. 'source: snapshot' after the editor restarted can be stale — pass refresh: true (or run /unreal-mcp sync) when the tool surface may have changed.",
 		"Never read a .uasset/.umap as text to answer an asset question: the bytes are garbled and incomplete, and the editor's loaded object is the only real decode.",
 		"A 'not in catalog' answer means the toolset is not mounted in this project or is outside the indexed set: pass action 'discover' to index all 52 mounted toolsets (~830 tools) before concluding a tool does not exist, then report the absence instead of inventing the call.",
@@ -554,7 +560,7 @@ export const unrealMcp = defineTool({
 
 	async execute(_id, params, _signal, _update, ctx) {
 		const cwd = params.cwd ?? ctx.cwd;
-		const action = params.action ?? (params.recipe ? "recipe" : params.tool ? "describe" : params.query ? "search" : "list");
+		const action = params.action ?? (params.code ? "dsl" : params.section ? "dsl" : params.recipe ? "recipe" : params.tool ? "describe" : params.query ? "search" : "list");
 		const ensured = await ensureCatalog({
 			cwd,
 			url: params.url,
@@ -684,6 +690,77 @@ export const unrealMcp = defineTool({
 			if (out.notes.length) lines.push("", ...out.notes.map((note) => `· ${note}`));
 			return result(lines.join("\n"), pyOut);
 		}
+		if (action === "dsl") {
+			const resolution = await resolvePyIndex({ cwd });
+			const usage = locateDslUsage({ engineRoot: resolution.engineRoot });
+			const blueprintTools = pickToolset(snapshot, "BlueprintTools");
+			const docsTool = blueprintTools?.tools.find((tool) => tool.short === "get_graph_dsl_docs");
+			const liveHint = docsTool
+				? `live grammar: call_tool(${callSkeleton(docsTool)})`
+				: "live grammar: BlueprintTools.get_graph_dsl_docs (not in the indexed catalog — run action 'discover' first)";
+			const dslOut = {
+				...out,
+				action: "dsl",
+				source: usage ? "engine" : "none",
+				catalog: { ...out.catalog, grammar: usage ? `${usage.file}:${usage.line}` : undefined },
+			};
+
+			if (params.code) {
+				const lint = lintDsl(params.code);
+				const header = usage
+					? `[grammar from ${normalizePath(usage.file)}:${usage.line}]`
+					: `[grammar not on disk for this engine — read it live]  ${liveHint}`;
+				const lines = [
+					header,
+					lintText(lint),
+					...(lint.errors.length ? ["Fix these before write_graph_dsl: the editor deletes the graph's existing nodes before it parses, so a syntax error is not a no-op."] : []),
+					"",
+					"invariants that catch the rest:",
+					...DSL_FACTS.map((fact) => `· ${fact}`),
+					"",
+					`${liveHint}  (full reference, 225 lines — read the section you need)`,
+				];
+				out.missing.push(...lint.errors.map((issue) => `${issue.line}:${issue.column} ${issue.message}`));
+				return result(lines.join("\n"), dslOut, false);
+			}
+
+			if (!usage) {
+				return result(
+					[
+						"No local copy of the Blueprint graph DSL for this engine.",
+						"The DSL module ships inside Engine/Plugins/Experimental/Toolsets/EditorToolset/Content/Python/editor_toolset/toolsets/blueprint_dsl.py — if it is missing, this engine does not ship the toolset.",
+						liveHint,
+						`…or with the editor open, \`unreal_mcp(action: "describe", tool: "get_graph_dsl_docs")\` shows its signature.`,
+						"Do not reconstruct the grammar from memory: write_graph_dsl compiles, and a wrong form is not a no-op.",
+					].join("\n"),
+					dslOut,
+					true,
+				);
+			}
+
+			const sections = dslUsageSections(usage.text);
+			const head = `[grammar · ${normalizePath(usage.file)}:${usage.line} · ${usage.text.split("\n").length} lines · ${sections.length} sections]`;
+			if (params.section) {
+				const wanted = params.section.toLowerCase();
+				const match = sections.find((section) => section.title.toLowerCase().includes(wanted));
+				if (!match) {
+					return result([head, `no section matching '${params.section}'`, `sections: ${sections.map((section) => section.title).join(" | ")}`].join("\n"), dslOut, true);
+				}
+				return result([head, "", `${match.title}`, match.body, "", `full text: ${liveHint}`].join("\n"), dslOut);
+			}
+			if (params.full) return result([head, "", usage.text, "", `The result is line-limited; read a single section with section: '<name>'. Full text: ${liveHint}`].join("\n"), dslOut);
+			const lines = [
+				head,
+				"  sections (pass section: to read one):",
+				...sections.map((section) => `    ${section.title.padEnd(52)} ${String(section.body.split("\n").length).padStart(3)} lines`),
+				"",
+				"check a script before writing it: unreal_mcp(action: 'dsl', code: '<DSL>') — syntactic traps only; the editor is still the parser.",
+				`the authoring order lives in the recipe: unreal_mcp(action: 'recipe', recipe: 'blueprint-graph-author')`,
+				`full text: ${liveHint}`,
+			];
+			return result(lines.join("\n"), dslOut);
+		}
+
 		if (action === "sync" || action === "discover") {
 			const head = action === "discover" ? `${sourceLine} catalog discovered from ${ensured.ctx.url}` : `${sourceLine} catalog synced from ${ensured.ctx.url}`;
 			const lines = [head, listText(snapshot), ...out.notes.map((note) => `· ${note}`)];
@@ -748,9 +825,31 @@ export const unrealMcp = defineTool({
 
 export const indexTools = [unrealSymbol, unrealSymbolList, unrealContext, unrealIndex, unrealMcp];
 
-/** `/unreal-mcp [status|sync|discover]` — health, a forced refresh of the indexed toolsets, or a full discovery of everything the editor mounts. */
+/** `/unreal-mcp [status|sync|discover|python|dsl]` — health, a forced refresh or a full discovery of the editor's toolsets, the plugins' Python toolsets, or the Blueprint graph DSL grammar. */
 export async function unrealMcpCommand(arg: string, cwd: string): Promise<string> {
 	const requested = arg.trim();
+	const [verb, ...rest] = requested.split(/\s+/);
+	if (verb === "dsl") {
+		// The grammar file is engine-side truth and needs no editor, so this works with the editor closed.
+		const resolved = await resolvePyIndex({ cwd });
+		const usage = locateDslUsage({ engineRoot: resolved.engineRoot });
+		if (!usage) {
+			return [
+				"unreal_mcp dsl: no local grammar (the EditorToolset plugin is not installed for the engine this project resolves to).",
+				...resolved.notes.map((note) => `· ${note}`),
+				"With the editor open, read it live: unreal_mcp action 'dsl' (it then falls back to BlueprintTools.get_graph_dsl_docs).",
+			].join("\n");
+		}
+		const sections = dslUsageSections(usage.text);
+		const wanted = rest.join(" ").toLowerCase();
+		const head = `blueprint graph DSL · ${normalizePath(usage.file)}:${usage.line} · ${usage.text.split("\n").length} lines`;
+		if (wanted) {
+			const match = sections.find((section) => section.title.toLowerCase().includes(wanted));
+			if (!match) return [head, `no section matching '${wanted}'`, `sections: ${sections.map((section) => section.title).join(" | ")}`].join("\n");
+			return [head, "", match.title, match.body].join("\n");
+		}
+		return [head, "sections ('/unreal-mcp dsl <name>' prints one; action 'dsl' code '<DSL>' lints a script):", ...sections.map((section) => `  ${section.title.padEnd(52)} ${String(section.body.split("\n").length).padStart(3)} lines`)].join("\n");
+	}
 	if (requested === "python") {
 		const resolved = await resolvePyIndex({ cwd });
 		const index = resolved.index;

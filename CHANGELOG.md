@@ -10,6 +10,55 @@ a renamed parameter, or answer text an existing consumer parses.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-11
+
+1.5.0 made the catalog complete and pointed at the tool's Python source. It still stopped short of the
+request that comes after "what does this Blueprint do": *change it*. `write_graph_dsl` takes an
+S-expression script and compiles the Blueprint, so the two ways to burn a turn were guessing the tool
+and guessing the syntax — and a wrong guess is not a no-op, it replaces the graph's nodes first. This
+release answers both: the grammar is read from the engine that will compile it, a script can be
+pre-flighted before it is sent, and the write ladder is spelled out step by step. The package still
+performs no writes.
+
+### Added
+
+- `unreal_mcp action="dsl"` — the Blueprint graph DSL, read from the resolved engine's own
+  `blueprint_dsl.py` (`USAGE` at line 23, 225 lines on 5.8): section index, one section by name, or the
+  full text. `action="dsl" code="…"` pre-flights a script. No editor needed; when the engine lacks the
+  plugin, the answer says so and points at the live `get_graph_dsl_docs` instead of inventing syntax.
+- `lintDsl` (in the new `lib/dsl-grammar.ts`) — a tokenizer plus shallow form tree that reports only
+  what is decidable without node semantics: unbalanced parens, unterminated strings, unquoted
+  `/Script/…` paths (the "Undefined variable" trap), `elif`/`else` that is not the last form of its
+  body, data arguments after an exec continuation, empty forms. Positions are `line:column`, and one
+  malformed string no longer cascades into a second "unclosed paren" error.
+- `blueprint-graph-author` recipe — the authoring ladder: `load_asset` → `can_edit_asset` → `list_graphs`
+  → `read_graph_dsl` (the recovery copy, captured *before* the write) → `get_graph_dsl_docs` →
+  `find_node_types` → `get_node_type_pins` → `write_graph_dsl` → `read_graph_dsl` (read-back) →
+  `is_dirty` → `save_assets`. Eleven steps, two writes.
+- `RecipeStep.write` / `.effect` and `Recipe.posture` — a write step renders as `[WRITE]` with the
+  sentence a caller must read first, and a write recipe renders an explicit boundary line: the package
+  emits those steps as `call_tool` shapes and performs none of them.
+- `skills/ue-blueprint-authoring` — the ladder, the grammar's real headings, the invariants that cost
+  turns (bind instead of repeating a call, quote paths, `:Pin` vs `(:Pin …)`, `elif` is the branch), and
+  the dead ends (`.uasset` reads, inventing ids from node titles).
+- `/unreal-mcp dsl [section]` — the grammar from the shell, with the editor closed.
+- Recipe parameters gained array values (`context_pins: []`, `asset_paths: [asset]`), so a skeleton for
+  `find_node_types` / `save_assets` is complete rather than half-filled.
+
+### Changed
+
+- `unreal_mcp`'s description, prompt guidelines and the session context card now carry the authoring
+  posture: read the graph, resolve id + pins, write, read back — and never read a `.uasset` for it.
+- `describeToolText` and the DSL answers cite `file:line` for the grammar, so the reference can be
+  opened rather than trusted.
+
+### Notes
+
+- A repeated inline call is **not** linted. `blueprint-graph-edit` is deferred until a real write has
+  been tested against a live editor; structural authoring (`create_*`, `set_*`, `apply`) stays out of
+  scope.
+- The grammar is read, never copied: no Epic text is redistributed by this package.
+
 ## [1.5.0] - 2026-11-11
 
 `unreal_mcp` covered four toolsets out of the 52 a real editor mounts, and stopped at the tool name —

@@ -57,7 +57,7 @@ project?", "Where is `FLpMovementDirectionThresholds` defined?", "What do I need
 | `unreal_symbol_list` | "What does this project define?" Names by prefix — `ULp`, `ANiMy`, `UAnim` |
 | `unreal_context` | "What does this file/module include, define, and depend on?" Include paths, dependency lists, the real `WITH_*` defines; for a module, also whether the target's module graph contains it and how the `.uproject` treats its plugin |
 | `unreal_index` | Builds and reports the source index, the path-only **header index** ("does this header exist in this engine version?"), the clangd compile database, a **clangd health probe**, targeted re-scans (`patch`), and cache reclaim (`status` / `prune`) |
-| `unreal_mcp` | "What is this editor tool called, and what arguments does it take?" The running editor's MCP toolsets as a local catalog — exact tool names, required flags, defaults, the ready-to-send `call_tool` shape, read-only inspection recipes for Blueprints, and the Python source line behind a toolset |
+| `unreal_mcp` | "What is this editor tool called, and what arguments does it take?" The running editor's MCP toolsets as a local catalog — exact tool names, required flags, defaults, the ready-to-send `call_tool` shape, inspection and graph-authoring recipes for Blueprints, the `unreal.*` type behind each object reference, the Blueprint graph DSL grammar and a script pre-flight, and the Python source line behind a toolset |
 
 A lookup returns the declaration line's own text under each hit, so the usual follow-up (`read` at
 `file:line`) is only needed when the surrounding context matters.
@@ -78,7 +78,7 @@ facts from UnrealBuildTool Query, is the part of this package that stays useful 
 | `/unreal-symbol <symbol>` | Definition lookup, project + plugins, then engine if an engine index exists |
 | `/unreal-module <Module>` | Module directory, public/private dependency lists, defines file, C++ standard, SDK |
 | `/unreal-cache stats\|clear` | Inspect or clear the cached indexes |
-| `/unreal-mcp [status\|sync]` | Editor toolset catalog health; `sync` re-reads the running editor's schemas, `discover` indexes every mounted toolset |
+| `/unreal-mcp [status\|sync]` | Editor toolset catalog health; `sync` re-reads the running editor's schemas, `discover` indexes every mounted toolset, `python` reports the plugins' own source, `dsl [section]` prints the Blueprint graph grammar |
 
 **Blueprint questions go through the editor, not the file.** A `.uasset`/`.umap` is not a readable
 document — the serialized bytes are garbled and do not reconstruct graphs, pins or defaults, so
@@ -128,6 +128,38 @@ python toolset: "BlueprintTools"
 C++-registered (`EditorAppToolset`, `LogsToolset`, …), and which ship in this engine but are not mounted
 because their plugin is disabled for this project. Argument truth stays with the live schema — the scan
 answers *where the tool is implemented and what it is called*, never *what it takes*.
+
+**And the graph DSL, for authoring.** `write_graph_dsl` takes an S-expression script and **compiles**
+the Blueprint, so a malformed script is not a cheap failure. The grammar is not invented here: it is the
+`USAGE` constant the toolset plugin ships, read from the resolved engine install (no editor needed) and
+available live as `BlueprintTools.get_graph_dsl_docs`. `action: "dsl"` returns the section index,
+`section: "NODE CALLS"` one section, and `code: "…"` a pre-flight check of a script:
+
+```text
+unreal_mcp action="dsl" section="MULTI-EXEC"
+[grammar · …/editor_toolset/toolsets/blueprint_dsl.py:23 · 225 lines · 11 sections]
+  MULTI-EXEC (latent/task nodes with named exec outputs)
+    …
+```
+
+```text
+unreal_mcp action="dsl" code='(fn F (V)
+  (if (< V 0) (return 0)
+    (elif (> V 1) (return 1))
+    (return V)))'
+pre-flight: 1 error(s) that write_graph_dsl would raise on:
+  3:5  'elif' must be the last form inside 'if' — it IS the else branch, not a statement after it
+```
+
+The pre-flight is syntactic only (parens, quoting, `elif`/`else` placement, exec-continuation order,
+unquoted `/Script/...` paths). Type ids and pin names are settled by `find_node_types` /
+`get_node_type_pins`, and the editor has the final word.
+
+**Authoring is a ladder, and the writes are yours to run.** `recipe: "blueprint-graph-author"` is the
+one recipe marked `[write]`: capture the graph (`read_graph_dsl`), resolve the node id and pin names,
+write, read back, save. The package emits those steps as `call_tool` shapes and executes none of them —
+it stays a read-only extension — so nothing changes in the editor without an explicit call from the
+agent or the user.
 
 Example — `/unreal`:
 

@@ -436,7 +436,7 @@ export function describeToolText(tool: McpToolEntry, options: { full?: boolean; 
 }
 
 /** Exact `call_tool` shape, one line per argument so it can be pasted with edits. */
-export function callSkeleton(tool: McpToolEntry, values: Record<string, string> = {}): string {
+export function callSkeleton(tool: McpToolEntry, values: Record<string, string | string[]> = {}): string {
 	const args: Record<string, unknown> = {};
 	for (const arg of tool.args) {
 		const given = values[arg.name];

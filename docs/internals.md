@@ -490,10 +490,59 @@ references become `{ "refPath": "<…>" }`, required scalars get a type-appropri
 **optional** args are omitted rather than fabricated — a `list_variables` skeleton has `blueprint`
 only, even though it also accepts an optional `graph`.
 
+### The graph DSL: read, never copied (`lib/dsl-grammar.ts`)
+
+`write_graph_dsl` takes an S-expression script and compiles the Blueprint, so its syntax is the highest-
+cost thing to guess. The syntax is not documented here or anywhere else we own: the EditorToolset plugin
+ships it as the `USAGE` triple-quoted constant of
+`<Engine>/Engine/Plugins/Experimental/Toolsets/EditorToolset/Content/Python/editor_toolset/toolsets/blueprint_dsl.py`
+(USAGE at line 23, 225 lines / 8.5 KB on 5.8), and `BlueprintTools.get_graph_dsl_docs` returns that same
+string live. `extractUsage` reads the constant out of the engine the project already resolves to, so the
+grammar is per-engine-version and the package stores no copy of it.
+
+`dslUsageSections` splits it at unindented all-caps headings, including ones with a parenthesised gloss
+(`MULTI-EXEC (latent/task nodes with named exec outputs)`); body text keeps its indentation. 5.8 yields
+11 sections: `GRAMMAR OVERVIEW`, `STATEMENTS`, `MULTI-EXEC …`, `EXPRESSIONS`, `NODE CALLS`, `OPERATORS`,
+`SWITCH ALIASES`, `SELF REFERENCE`, `COMMENTS`, `IMPORTANT — REUSE VALUES WITH BIND, NEVER REPEAT CALLS`,
+`EXAMPLES`.
+
+`lintDsl` is a tokenizer plus a shallow form tree, deliberately not a transpiler. It reports only what is
+decidable without node semantics:
+
+| check | severity | why it is cheap to catch |
+|---|---|---|
+| unclosed `(` / stray `)` / unterminated string | error | an unclosed form swallows the rest of the script |
+| unquoted `/Script/…`, `/Game/…` path | error | unquoted words are variable references — the script compiles to "Undefined variable" |
+| `elif` / `else` not the last form of its body | error | they *are* the else branch, so a statement after them is dropped |
+| data/expr form after an exec continuation | warning | continuations must come last in the call |
+| keyword-headed continuation with no body | warning | `(:Pin)` alone is a no-op |
+| empty `()` | warning | usually a truncated paste |
+
+An unterminated string suppresses the paren-balance error it would otherwise cascade into. Nothing here
+claims a script is valid: type ids and pin names are settled by `find_node_types` /
+`get_node_type_pins`, and the editor's parser is the final word. A repeated inline call is *not*
+flagged — that heuristic is deferred until a real edit has been tested end to end.
+
+### Authoring is a ladder marked `[write]`
+
+`blueprint-graph-author` is the only recipe with `posture: "write"`. Two of its eleven steps carry
+`write: true` + `effect`: `write_graph_dsl` (replaces the graph's nodes, compiles) and `save_assets`
+(persists). The renderer prints a boundary line for a write recipe and tags those steps `[WRITE]`, so the
+prose and the shape stay together. Ordering is load-bearing and asserted in tests: capture
+`read_graph_dsl` *before* the write (it is the recovery copy — the write clears existing nodes first),
+resolve the id with `find_node_types`, resolve pins with `get_node_type_pins`, then write, then
+`read_graph_dsl` again, then `is_dirty`, then `save_assets`.
+
+The package still never calls a toolset: the steps come back as `call_tool` shapes and the caller performs
+them. `annotations.readOnlyHint` therefore stays honest without weakening the answer — the tool reports
+what a write would do, and executes nothing.
+
 ### Deliberate scope
 
-Inspection only: no `create_*`, `set_*`, `write_graph_dsl`, `compile_blueprint`, `save_asset` — the
-catalog can name a mutating tool, but the package never calls one.
+Inspection and DSL *shapes*: no `create_*`, no `set_*`, no structural authoring, no `apply`, and no
+toolset call of any kind — the catalog can name a mutating tool and the authoring recipe can spell out its
+arguments, but the package never sends it. `blueprint-graph-edit` (an inline-call lint rule and a
+separate edit ladder) is deferred until a real write has been tested against a live editor.
 
 The Python-side index exists for the *locator* question only (see above); C++-registered toolsets have
 no Python class, so the live editor remains the authority on what is callable. Python Developer Mode
@@ -503,8 +552,16 @@ harvest, and the API documentation is versioned per engine release — so bindin
 
 ## Known limits
 
-- `unreal_mcp` scope is inspection. `discover` indexes every mounted toolset, but `python` reads only
-  what ships as plugin Python; a toolset registered purely in C++ has no source location to point at.
+- `unreal_mcp` scope is inspection plus DSL shapes. `discover` indexes every mounted toolset, but
+  `python` reads only what ships as plugin Python; a toolset registered purely in C++ has no source
+  location to point at. The authoring recipe emits `call_tool` shapes for `write_graph_dsl` /
+  `save_assets` and calls neither.
+- The DSL pre-flight is syntactic. It cannot know whether a `Type|Id` or a pin name exists, and it does
+  not flag a repeated inline call (deferred until a real graph edit is tested). A clean pre-flight is
+  not a valid script.
+- The DSL grammar is read from the *resolved engine's* plugin file. An engine without the EditorToolset
+  plugin has no local copy: `action: "dsl"` then reports that and points at the live
+  `get_graph_dsl_docs` instead of inventing syntax.
 - Registry access needs `pwsh` (PowerShell 7). Without it, registry sources are unavailable and
   resolution relies on env, directory scans, and inline associations.
 - `unreal_resolve_engine` reports what the machine can prove. It does not install, register, or

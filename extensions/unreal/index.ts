@@ -564,8 +564,9 @@ async function buildContextCard(cwd: string): Promise<string | undefined> {
 		`  plugin references declared: ${descriptor.plugins.length}`,
 		"  engine sources: use the resolved root above + unreal_context for module/include facts; never infer an engine path from memory.",
 		"  conventions: editor closed before C++ edits; never hand-edit .uasset/.umap; never clang-format .cs.",
-		`  tools: unreal_resolve_engine, unreal_project_inspect, unreal_plugin_inspect, unreal_symbol (declaration → file:line + module, project+plugins, engine when an engine index exists), unreal_symbol_list (symbols in a file), unreal_context (module deps, include paths, defines), unreal_index (build/status/patch/prune, header index, UBT Query, compile database), unreal_mcp (editor toolset catalog: exact tool names + arguments, 'discover' for every mounted toolset, 'python' for the toolset's own source line, live or from the snapshot). Commands: /unreal, /unreal-engines, /unreal-cache, /unreal-symbol, /unreal-module, /unreal-mcp.`,
+		`  tools: unreal_resolve_engine, unreal_project_inspect, unreal_plugin_inspect, unreal_symbol (declaration → file:line + module, project+plugins, engine when an engine index exists), unreal_symbol_list (symbols in a file), unreal_context (module deps, include paths, defines), unreal_index (build/status/patch/prune, header index, UBT Query, compile database), unreal_mcp (editor toolset catalog: exact tool names + arguments, 'discover' for every mounted toolset, 'python' for the toolset's own source line, 'dsl' for the Blueprint graph grammar + a script pre-flight, live or from the snapshot). Commands: /unreal, /unreal-engines, /unreal-cache, /unreal-symbol, /unreal-module, /unreal-mcp.`,
 		"  asset questions: never read a .uasset/.umap as text — the bytes are garbled. Use unreal_mcp recipe 'blueprint-inspect' against the running editor; a tool name that is not in the catalog gets 'search' then 'python', never a guess.",
+		"  graph authoring: recipe 'blueprint-graph-author' is the [write] ladder — read_graph_dsl first (recovery copy), then find_node_types/get_node_type_pins, then write_graph_dsl (it compiles), then read back. This package emits the call shapes; the caller performs the writes.",
 		`  gates: .uasset/.umap edits are blocked on every platform; the "editor is running" warning needs tasklist (Windows) or pgrep (elsewhere) on PATH — ${process.platform === "win32" ? "tasklist" : "pgrep"} is the probe here.`,
 	];
 	return lines.join("\n");
@@ -683,7 +684,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("unreal-mcp", {
-		description: "Editor toolset catalog: /unreal-mcp [status|sync|discover|python] — sync re-reads the indexed toolsets, discover indexes every toolset the editor mounts, python reports the toolset plugins' own source",
+		description: "Editor toolset catalog: /unreal-mcp [status|sync|discover|python|dsl] — sync re-reads the indexed toolsets, discover indexes every toolset the editor mounts, python reports the toolset plugins' own source, dsl prints the Blueprint graph grammar (no editor needed)",
 		handler: async (args, ctx) => {
 			ctx.ui.notify("unreal_mcp: reading the editor toolset catalog…", "info");
 			const text = await unrealMcpCommand(args, ctx.cwd);

@@ -13,7 +13,7 @@ import {
 	searchTools,
 	type CatalogSnapshot,
 } from "../extensions/unreal/lib/mcp-catalog.ts";
-import { RECIPES, renderRecipe } from "../extensions/unreal/lib/mcp-recipes.ts";
+import { RECIPES, recipeIndexText, renderRecipe } from "../extensions/unreal/lib/mcp-recipes.ts";
 
 /**
  * The fixture is hand-written, not an Epic dump: the point of these tests is the normalization and
@@ -219,6 +219,33 @@ describe("recipes", () => {
 		const rendered = renderRecipe(RECIPES["blueprint-variables"]!, snapshot());
 		expect(rendered.text).toContain("NOT IN CATALOG");
 		expect(rendered.missing.some((entry) => entry.includes("get_variable_category"))).toBe(true);
+	});
+
+	test("the only authoring recipe captures the graph before it writes it", () => {
+		const recipe = RECIPES["blueprint-graph-author"]!;
+		expect(recipe.posture).toBe("write");
+		const index = (tool: string) => recipe.steps.findIndex((step) => step.tool === tool);
+		expect(index("read_graph_dsl")).toBeGreaterThan(-1);
+		expect(index("read_graph_dsl")).toBeLessThan(index("write_graph_dsl"));
+		// The write is preceded by the two discovery calls that make it correct, and followed by a read-back.
+		expect(index("find_node_types")).toBeLessThan(index("write_graph_dsl"));
+		expect(index("get_node_type_pins")).toBeLessThan(index("write_graph_dsl"));
+		expect(recipe.steps.slice(index("write_graph_dsl") + 1).some((step) => step.tool === "read_graph_dsl")).toBe(true);
+	});
+
+	test("every write step states what it does, and the boundary is rendered", () => {
+		const recipe = RECIPES["blueprint-graph-author"]!;
+		const writes = recipe.steps.filter((step) => step.write);
+		expect(writes.map((step) => step.tool)).toEqual(["write_graph_dsl", "save_assets"]);
+		for (const step of writes) expect(step.effect?.length ?? 0).toBeGreaterThan(20);
+		// Nothing in this package may perform a write: every recipe is catalog lookups only.
+		for (const candidate of Object.values(RECIPES)) {
+			for (const step of candidate.steps) expect(step.tool).not.toContain("apply");
+			expect(candidate.posture === "read" || candidate.posture === "write").toBe(true);
+		}
+		const rendered = renderRecipe(recipe, snapshot(), {});
+		expect(rendered.text).toContain("boundary: steps marked [WRITE]");
+		expect(recipeIndexText()).toContain("blueprint-graph-author [write]");
 	});
 });
 
