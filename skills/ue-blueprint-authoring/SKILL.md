@@ -30,7 +30,7 @@ Eleven steps, of which two are writes:
 |---|---|---|
 | 1 | `AssetTools.load_asset` | the Blueprint object every later call takes |
 | 2 | `AssetTools.can_edit_asset` | whether anyone else holds it |
-| 3 | `BlueprintTools.list_graphs` | the graph handle (`write_graph_dsl` takes a graph, not the asset) |
+| 3 | `BlueprintTools.get_graph {graph_name}` | the graph object (`write_graph_dsl` takes a graph object, not the asset and not a name — `list_graphs` only prints names) |
 | 4 | `BlueprintTools.read_graph_dsl` | the current script = the recovery copy |
 | 5 | `BlueprintTools.get_graph_dsl_docs` | the grammar, from the engine |
 | 6 | `BlueprintTools.find_node_types(graph, type_id_filter, context_pins)` | the `Type\|Id` ids |

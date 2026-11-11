@@ -10,6 +10,79 @@ a renamed parameter, or answer text an existing consumer parses.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-11
+
+A field report from a real project (Lp, UE 5.8.3) found the tooling confident where it was wrong. Four
+answers were contractually false — `list_variables` "with types", `list_functions` as a signature
+source, a graph name as a graph handle, and "a plugin the .uproject does not reference" for a plugin
+the editor had mounted — and one planner never worked at all (`unreal_context` on a project). This
+release makes each answer say what it actually contains, and makes the project index cover the plugins
+the project actually loads.
+
+### Added
+
+- `pluginAreas` on `unreal_symbol`, `unreal_symbol_list` and `unreal_index` — extra engine plugins for
+  the **project** index roots, named either as a plugin (`"PhysicsControl"`) or as its engine area
+  (`"Plugins/Animation/PhysicsControl"`). Seconds per plugin, no engine scan: the alternative
+  `engineAreas ["Plugins"]` walks every plugin in the install, and adding a `.uproject` reference to
+  answer one question edits the project. Resolved once in the workspace (`resolveWorkspace`), so index
+  builds, header roots, compile-db roots and the status line agree.
+- `blueprint-signatures` recipe — what one function or event takes and returns: `get_graph` (a function
+  owns a graph named after it) → `find_nodes {title: "", entry_points_only: true}` → `get_node_infos`
+  (`input_pins` are the parameters; the function-result node's `input_pins` are the returns).
+  `list_functions` stays in the ladder as a candidate list, now labelled as one.
+- `unreal_context` availability now names *how* a plugin loads, with the chain:
+  `Enabled transitively: AnimatorKit (EnabledByDefault) declares PhysicsControl — it is loaded, no
+  .uproject reference needed (chain EnabledByDefault:AnimatorKit <- AnimatorKit)`.
+- `pluginCoverage` (lib) — one count of the three enablement buckets the project's roots can be read
+  against: referenced by the `.uproject`, `EnabledByDefault`, declared by an enabled plugin.
+
+### Changed
+
+- **Project index roots are the plugins the project loads, not just its `.uproject` references.** An
+  enablement closure (`.uproject` references + `EnabledByDefault` plugins + the plugins those declare
+  directly) decides which plugin directories are scanned: on Lp that is 25 referenced + 81 declared =
+  106 roots instead of 25, and `unreal_symbol scope="project" query="UPhysicsControlComponent"` and
+  `"UBlendStackAnimNodeLibrary"` answer without `scope: "engine"`. The ~189 `EnabledByDefault` plugins
+  that nothing declares stay out of the default roots (they are seconds each, not free); `pluginAreas`
+  is the opt-in.
+- Recipes that read or write a graph now convert the name to the object first: `list_graphs` prints
+  names, `get_graph {graph_name}` returns the graph every reader takes. A bare name fails with
+  `Parameter error: EventGraph is not a valid object path for property 'graph'`, and that sentence is
+  now the recipe's dead-end line. Applies to `blueprint-inspect`, `blueprint-behaviour` and
+  `blueprint-graph-author`.
+- `list_variables` is described as what it returns — names, inherited excluded — and the type read
+  moved to where types actually live: `get_default_object` → `ObjectTools.list_properties` (JSON
+  schema: `type`, enum values, nested struct `properties`), then `get_properties`. The recipe warns
+  that schema keys are display-sanitized (`start Time`, `blend Time`, `notifyTransition_Re-Transition`)
+  and are not the variable names.
+- Zero-row notes and `unreal_index action="status"` counts now separate the three buckets
+  (`engine plugins on disk: 897; enabled in this project: 25 referenced + 189 EnabledByDefault + 96
+  declared by an enabled plugin; project index roots cover 106; 204 are enabled by nothing`) and name
+  the enabled-but-not-indexed plugins an answer may have missed, with the `pluginAreas` call that adds
+  one. Parse the counts, not the sentence.
+- `verify` guidance for `find_nodes`: `title` is required by the schema but `""` matches every node, so
+  `title: ""` + `entry_points_only` is the list-the-entry-nodes call; entry-node titles are not the
+  editor display names.
+
+### Fixed
+
+- `unreal_context` (and index builds with `mode: "full"`) never passed `-Project=` to UnrealBuildTool,
+  so `-Mode=Query` resolved the target against the engine-only rule assembly and failed:
+  `Failed to query available targets: Couldn't find target rules file for target 'LpEditor' in rules
+  assembly 'UE5Rules'` → `UnrealBuildTool Query produced no JSON`. All three `ensureQueryJson` call
+  sites now pass `workspace.projectPath`; measured on Lp: `TargetDetails` 12 s, `TargetModuleReferences`
+  3 s, module `PhysicsControl` resolved (`includePaths: 0` — that gap is TargetDetails's, not ours).
+- `unreal_context module="PhysicsControl"` no longer claims `.uproject reference: NOT referenced` means
+  "needs a reference"; a transitively enabled plugin is reported as loaded, with the chain.
+
+### Notes
+
+- The type of a variable and the signature of a function are two reads the toolset does not offer
+  directly (`BlueprintEditorLibrary` has `GetMemberVariableType`, a candidate for an upstream patch).
+  The recipes document the verified paths instead of inventing tool names: no `get_variable_type`, no
+  `get_variable_instance_editable` — the latter has no reader at all.
+
 ## [1.6.0] - 2026-11-11
 
 1.5.0 made the catalog complete and pointed at the tool's Python source. It still stopped short of the

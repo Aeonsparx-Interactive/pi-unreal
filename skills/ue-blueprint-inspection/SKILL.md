@@ -44,21 +44,39 @@ the asset. They are **three separate toolsets**, so this is never one call.
 
 1. `AssetTools.load_asset {asset_path}` → Blueprint object (everything else needs this handle, not a path).
 2. `BlueprintTools.get_parent {blueprint}` → C++ parent / parent Blueprint (defines the inherited surface).
-3. `BlueprintTools.list_graphs {blueprint}` → graph handles.
-4. `BlueprintTools.list_functions`, `list_events`, `list_variables {blueprint}` → the member surface.
-5. `BlueprintTools.get_default_object {blueprint}` → CDO.
-6. `ObjectTools.list_properties {instance=<CDO>}` → property **names** (required before values).
-7. `ObjectTools.get_properties {instance=<CDO>, properties:[…]}` → actual default values.
-8. `BlueprintTools.read_graph_dsl {graph}` → node-level DSL for one graph (same DSL `write_graph_dsl` consumes).
+3. `BlueprintTools.list_graphs {blueprint}` → graph **names** (`EventGraph`, `Set_InteractionTransform`).
+4. `BlueprintTools.get_graph {graph_name}` → the graph **object** every graph reader needs. Names are
+   not handles: `read_graph_dsl {graph: "EventGraph"}` fails with
+   `Parameter error: EventGraph is not a valid object path for property 'graph'`.
+5. `BlueprintTools.list_functions`, `list_events`, `list_variables {blueprint}` → the member surface
+   (names and, for functions, `description`/`bIsImplemented` — **not** signatures, **not** types).
+6. `BlueprintTools.get_default_object {blueprint}` → CDO.
+7. `ObjectTools.list_properties {instance=<CDO>}` → the JSON **schema**: per property a `type`, and for
+   enums the values, nested inside structs. This is the only reader of a variable's type.
+8. `ObjectTools.get_properties {instance=<CDO>, properties:[…]}` → actual default values.
+9. `BlueprintTools.read_graph_dsl {graph=<object from step 4>}` → node-level DSL for one graph (same
+   DSL `write_graph_dsl` consumes).
 
-Targeted questions skip step 8: `find_nodes {graph, title}` (title substring, plus `entry_points_only`)
-then `get_node_infos {nodes}`. `get_connected_subgraph {node}` answers "what runs after this" but is
-the largest payload in the toolset — narrow it before calling.
+Targeted questions skip step 9: `find_nodes {graph, title}` (title substring, plus `entry_points_only`)
+then `get_node_infos {nodes}`. A function's signature is that ladder on its own graph: `get_graph
+{graph_name="Set_InteractionTransform"}` → `find_nodes {title: "", entry_points_only: true}` →
+`get_node_infos` (`input_pins` = parameters; empty = zero-arg). `get_connected_subgraph {node}`
+answers "what runs after this" but is the largest payload in the toolset — narrow it before calling.
 
 ## Dead ends that cost turns
 
-- `read_graph_dsl` takes a **graph object** from `list_graphs`, not a graph name string.
-- `find_nodes` requires `title`; it is not a list-all call.
+- `read_graph_dsl` / `write_graph_dsl` take a **graph object**, not the name `list_graphs` printed;
+  `get_graph {graph_name}` is the conversion, and hand-built `refPath`s do not substitute.
+- `find_nodes` marks `title` required but treats `""` as match-any: `title: ""` + `entry_points_only`
+  *is* the list-the-entry-nodes call. Its entry-node titles are not the editor display names.
+- `list_functions` is a candidate list (`name`, `description`, `bIsImplemented`); it carries no
+  parameters or return values. Read a signature from the function's graph.
+- `list_variables` returns **names only** (inherited excluded). There is no `get_variable_type` and no
+  `get_variable_instance_editable`; types come from the CDO schema in step 7, and the per-instance
+  flag has no toolset reader at all.
+- The CDO schema's keys are display-sanitized (`start Time`, `blend Time`, `search Cost`,
+  `notifyTransition_Re-Transition`), so they are not the names `list_variables` printed. Pass the
+  schema's exact key to `get_properties`.
 - `get_properties` requires the name list from `list_properties`; it does not enumerate.
 - `get_variable_category` / `get_variable_replication` are per-variable calls; `list_variables` omits both.
 - Python's `unreal.BlueprintEditorLibrary` names are **not** the toolset names. Do not translate one

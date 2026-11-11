@@ -125,7 +125,32 @@ which index produced the answer. Two field findings drove this:
   (measured on this box: 481 MB of cache, 177 MB of it unreachable — 251 + 84 MB orphaned engine
   scans, 75 MB of v4-format indexes, superseded project entries).
 
-Engine plugins the project does **not** reference are in no root: `engineAreas: ["Plugins"]` adds
+### Project roots are the plugins the project *loads*
+
+`workspace.pluginDirs` is the enablement closure's index-root projection
+(`computeEnablementClosure` → `enablementIndexRoots` in `lib/plugin-resolver.ts`), not the `.uproject`
+reference list: references with `Enabled: true`, plus every `EnabledByDefault` plugin, plus the plugins
+those declare **directly**. On Lp that is 25 + 96 = 106 plugin roots, and it is why
+`unreal_symbol scope: "project" query: "UPhysicsControlComponent"` answers (the plugin loads because
+`AnimatorKit`, which is `EnabledByDefault`, declares it) instead of returning 0 and telling the reader
+to edit the `.uproject`. Two deliberate limits:
+
+- The ~189 `EnabledByDefault` plugins are seeds in the closure but not roots: indexing them by default
+  is the minutes-scale `engineAreas: ["Plugins"]` cost this design exists to avoid.
+- Deeper dependency chains are not roots either. One plugin is seconds, so `pluginAreas: ["X"]` (also
+  accepted as its area, `["Plugins/Animation/X"]`) adds exactly that plugin to the project roots. It
+  lives on the **workspace** (`resolveWorkspace(cwd, fs, deps, { pluginAreas })`), so an index build,
+  its key, the header roots, the compile-db roots and `action: "status"` all see the same roots — an
+  `unreal_index`-only dial would orphan the index against every lookup.
+
+Every 0-row answer prints the three buckets (`enabled in this project: 25 referenced by the .uproject
++ 189 EnabledByDefault + 96 declared by an enabled plugin; project index roots cover 106`), names the
+enabled-but-not-indexed plugins that match the query, and offers `pluginAreas` before `engineAreas`.
+`unreal_context`'s module availability reads the same closure, so a transitively enabled plugin says
+`Enabled transitively: AnimatorKit (EnabledByDefault) declares PhysicsControl — it is loaded, no
+.uproject reference needed`, and "not referenced" no longer implies "not loaded".
+
+Engine plugins nothing enables are still in no root: `engineAreas: ["Plugins"]` adds
 every `Engine/Plugins` source tree (~2.8× the `Runtime` scan),
 `["Plugins/Animation/PhysicsControl"]` adds one. `scopeForPath` routes a file to a scope, and an
 engine-scope file miss falls back to the project index **before** declaring a miss: plugin headers
@@ -479,7 +504,11 @@ another.
 ### Recipes are data
 
 `lib/mcp-recipes.ts` holds the read-only ladders (`blueprint-inspect`, `blueprint-variables`,
-`blueprint-behaviour`) as `{toolset, tool, args, why, deadEnd?}` steps. Rendering resolves every step
+`blueprint-signatures`, `blueprint-behaviour`) as `{toolset, tool, args, why, deadEnd?}` steps. Each one
+encodes a field-verified contract rather than a plausible ordering: `list_graphs` prints names and
+`get_graph` converts a name into the graph object every reader takes, `list_functions` is a candidate
+list with no signature, `list_variables` is names-only and the types come from the CDO's
+`list_properties` schema (whose keys are display-sanitized). Rendering resolves every step
 against the catalog: a step whose toolset is unmounted or whose tool moved is printed as
 `NOT IN CATALOG` and listed in `missing`, which is the whole point — the recipe cannot silently drift
 into a plausible-but-wrong call. `args` values are templates (`${asset}`, `${step1}`); step references

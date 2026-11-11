@@ -233,6 +233,49 @@ describe("recipes", () => {
 		expect(recipe.steps.slice(index("write_graph_dsl") + 1).some((step) => step.tool === "read_graph_dsl")).toBe(true);
 	});
 
+	test("every graph-reading ladder converts a name with get_graph first", () => {
+		// 2026-11-11 field failure: `read_graph_dsl {graph: {refPath: "EventGraph"}}` →
+		// `Parameter error: EventGraph is not a valid object path for property 'graph'`.
+		const graphTools = ["read_graph_dsl", "write_graph_dsl", "find_nodes", "get_connected_subgraph"];
+		for (const recipe of Object.values(RECIPES)) {
+			recipe.steps.forEach((step, index) => {
+				if (!graphTools.includes(step.tool)) return;
+				const earlier = recipe.steps.slice(0, index).filter((candidate) => candidate.tool === "get_graph");
+				expect(earlier.length).toBeGreaterThan(0);
+				expect(earlier[0]!.args.graph_name).toBeDefined();
+			});
+		}
+		// And the dead end is spelled out where the mistake is made.
+		const inspect = RECIPES["blueprint-inspect"]!;
+		const graphs = inspect.steps.find((step) => step.tool === "list_graphs")!;
+		expect(graphs.deadEnd).toContain("not a valid object path for property 'graph'");
+	});
+
+	test("a candidate list is never sold as a signature or a typed variable list", () => {
+		const inspect = RECIPES["blueprint-inspect"]!;
+		const functions = inspect.steps.find((step) => step.tool === "list_functions")!;
+		expect(functions.deadEnd).toContain("no parameters, no return values");
+		const variables = inspect.steps.find((step) => step.tool === "list_variables")!;
+		expect(variables.why).toContain("NAMES");
+		expect(variables.deadEnd).toContain("no types");
+		const typed = RECIPES["blueprint-variables"]!;
+		expect(typed.summary).not.toContain("with types");
+		expect(typed.steps.find((step) => step.tool === "list_properties")).toBeDefined();
+		expect(typed.steps.find((step) => step.tool === "list_properties")!.deadEnd).toContain("display-sanitized");
+	});
+
+	test("blueprint-signatures reads the entry node pins, and find_nodes is match-any", () => {
+		const recipe = RECIPES["blueprint-signatures"]!;
+		expect(recipe.posture).toBe("read");
+		const tools = recipe.steps.map((step) => step.tool);
+		expect(tools).toEqual(["load_asset", "get_graph", "find_nodes", "get_node_infos"]);
+		const find = recipe.steps.find((step) => step.tool === "find_nodes")!;
+		expect(find.args.title).toBe("");
+		expect(find.args.entry_points_only).toBe(true);
+		expect(find.deadEnd).toContain("entry node titles are not display names");
+		expect(recipeIndexText()).toContain("blueprint-signatures");
+	});
+
 	test("every write step states what it does, and the boundary is rendered", () => {
 		const recipe = RECIPES["blueprint-graph-author"]!;
 		const writes = recipe.steps.filter((step) => step.write);

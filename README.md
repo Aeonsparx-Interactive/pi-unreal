@@ -98,7 +98,16 @@ recipe blueprint-inspect
 ...
 3. BlueprintTools.list_graphs   Lists all graphs in the Blueprint.
    call: call_tool({"toolset_name":"editor_toolset.toolsets.blueprint.BlueprintTools","tool_name":"list_graphs","arguments":{"blueprint":"<result of step 1>"}})
+   why: Graph NAMES — the index of what exists in this Blueprint.
+   dead end avoided: A name is not a graph handle: read_graph_dsl rejects a bare name with
+   `Parameter error: EventGraph is not a valid object path for property 'graph'`. Step 4 turns the
+   name you picked into the object.
 ```
+
+The ladders also encode what each answer actually contains: `list_functions` is a candidate list
+(`name`, `description`, `bIsImplemented` — no signature; `recipe: "blueprint-signatures"` reads one),
+`list_variables` is names-only (`recipe: "blueprint-variables"` gets types from the CDO's
+`list_properties` schema), and `get_graph` is the name → object step every graph reader needs.
 
 The source line is part of the answer: `live` (schemas just read from the editor), `snapshot` (cached,
 editor down — names and arguments are still right, calls are not), or "no catalog" (start the editor,

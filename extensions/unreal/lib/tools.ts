@@ -13,7 +13,7 @@
 
 import { parseUproject, type EngineVersion } from "./descriptors.ts";
 import { cacheDir } from "./cache.ts";
-import { buildPluginIndex, resolveProjectPlugins, type PluginReferenceResult, type PluginSummary } from "./plugin-resolver.ts";
+import { buildPluginIndex, computeEnablementClosure, enablementIndexRoots, resolveProjectPlugins, type EnablementClosure, type EnablementKind, type PluginEnablement, type PluginReferenceResult, type PluginSummary } from "./plugin-resolver.ts";
 import { findProjectFile, resolveEngineForProject, type ResolverDeps } from "./engine-resolver.ts";
 import { ensureQueryJson, pickTarget, queryCachePaths, queryCacheState, humanAge, type CachePaths, type TargetChoice } from "./query.ts";
 import {
@@ -79,8 +79,16 @@ export interface Workspace {
 	projectName?: string;
 	engineRoot?: string;
 	engineVersion?: EngineVersion;
-	/** Directories of plugins the `.uproject` enables, used as index roots. */
+	/**
+	 * Directories a project index scans as plugin roots: every `.uproject` reference plus the plugins
+	 * those (or an `EnabledByDefault` plugin) declare directly. See `enablementIndexRoots`.
+	 */
 	pluginDirs: string[];
+	/**
+	 * Why each plugin of this project is loaded — `.uproject` reference, `EnabledByDefault`, or a
+	 * `Plugins[]` declaration of an already-enabled plugin. Absent when plugin resolution failed.
+	 */
+	enablement?: EnablementClosure;
 	/**
 	 * Declared module names per plugin root dir (from each `.uplugin`). A module directory takes the
 	 * name of its `*.Build.cs` file, which is how `Engine/Plugins/Animation/PoseSearch/Source/Runtime`
@@ -94,7 +102,18 @@ export interface Workspace {
 	notes: string[];
 }
 
-export async function resolveWorkspace(cwd: string, fs: FsAdapter = realFs, deps: ResolverDeps = {}): Promise<Workspace> {
+export interface WorkspaceOptions {
+	/**
+	 * Extra engine plugins for this workspace's project index roots — a plugin name
+	 * (`PhysicsControl`, `Animation/PhysicsControl`) or its area (`Plugins/Animation/PhysicsControl`).
+	 * The one-plugin alternative to `engineAreas ["Plugins"]`, which scans every plugin in the engine and
+	 * keys a different index; entries land in `pluginDirs`, so every lookup, header root and compile-db
+	 * scope of this workspace sees them.
+	 */
+	pluginAreas?: string[];
+}
+
+export async function resolveWorkspace(cwd: string, fs: FsAdapter = realFs, deps: ResolverDeps = {}, options: WorkspaceOptions = {}): Promise<Workspace> {
 	const notes: string[] = [];
 	const workspace: Workspace = { cwd: normalizePath(cwd), pluginDirs: [], pluginModuleNames: {}, pluginRefs: [], plugins: [], notes };
 
@@ -128,14 +147,29 @@ export async function resolveWorkspace(cwd: string, fs: FsAdapter = realFs, deps
 		const refs = resolveProjectPlugins(descriptor, index, workspace.engineVersion);
 		workspace.pluginRefs = refs;
 		workspace.plugins = index.entries;
-		workspace.pluginDirs = refs.filter((ref) => ref.plugin).map((ref) => normalizePath(ref.plugin!.dir));
+		/* Loaded ≠ referenced. `PluginManager` walks the same closure this computes: `.uproject`
+		   references, `EnabledByDefault` descriptors, and every `Plugins[]` entry an enabled plugin
+		   declares. Project index roots take the references plus their direct dependencies — the
+		   `EnabledByDefault` bulk (~300 plugins on a 5.8 install) would turn every project scan into an
+		   engine-wide one. */
+		const enablement = computeEnablementClosure(descriptor, index);
+		workspace.enablement = enablement;
+		workspace.pluginDirs = enablementIndexRoots(enablement).map((plugin) => normalizePath(plugin.dir));
 		for (const entry of index.entries) {
 			const names = entry.modules.map((module) => module.moduleName).filter(Boolean);
 			if (names.length) workspace.pluginModuleNames[normalizePath(entry.dir)] = names;
 		}
 		const missing = refs.filter((ref) => ref.status === "missing").map((ref) => ref.name);
 		if (missing.length) notes.push(`plugin references with no descriptor: ${missing.join(", ")}`);
-		notes.push(`${workspace.pluginDirs.length} enabled plugin reference(s) resolved for index roots`);
+		const implied = workspace.pluginDirs.length - enablement.referenced.length;
+		notes.push(
+			`${workspace.pluginDirs.length} plugin root(s) for project index builds: ${enablement.referenced.length} referenced by the .uproject${implied > 0 ? ` + ${implied} declared by a referenced or EnabledByDefault plugin` : ""}; ${enablement.defaultEnabled.length} EnabledByDefault plugin(s) also load and stay out of the default roots (unreal_index pluginAreas adds one)`,
+		);
+		const extra = resolvePluginAreaDirs(workspace, options.pluginAreas);
+		for (const dir of extra.dirs) workspace.pluginDirs.push(dir);
+		if (options.pluginAreas?.length) {
+			notes.push(`pluginAreas ${options.pluginAreas.join(", ")}: ${extra.dirs.length} extra plugin root(s) for this workspace${extra.unresolved.length ? `; no plugin matches ${extra.unresolved.join(", ")}` : ""}`);
+		}
 	} catch (error) {
 		notes.push(`plugin resolution failed: ${(error as Error).message}`);
 	}
@@ -412,18 +446,52 @@ function coverageOf(handle: IndexHandle, workspace: Workspace, scope: Scope, are
 }
 
 /**
- * Engine plugins present on disk that the `.uproject` does not reference. They are compiled by the
- * target graph (their modules show up in `TargetModuleReferences`), and they are loaded when
- * `EnabledByDefault` is true — but they are not index roots, so a symbol lookup cannot see them.
- * This is the coverage hole behind every "the engine has no such type" answer.
+ * Which engine plugins this project can actually see, in three buckets that a 0-row answer must not
+ * conflate: referenced by the `.uproject`, enabled some other way (and either covered by a project
+ * index root or not), and enabled by nothing at all.
+ *
+ * The middle bucket is the field-session hole: `PhysicsControl` is mounted because `AnimatorKit`
+ * declares it, so "a plugin the project does not reference is in no index root" was advice about a
+ * plugin the editor had already loaded.
  */
-export function unreferencedEnginePlugins(workspace: Workspace): { enginePlugins: number; referenced: number; names: string[] } {
-	const referenced = new Set(workspace.pluginRefs.map((ref) => ref.name.toLowerCase()));
-	const seen = new Map<string, true>();
-	for (const plugin of workspace.plugins) {
-		if (plugin.source === "Engine" && !referenced.has(plugin.name.toLowerCase())) seen.set(plugin.name, true);
+export interface PluginCoverage {
+	/** Engine `.uplugin` descriptors found on disk. */
+	enginePlugins: number;
+	referenced: number;
+	defaultEnabled: number;
+	transitive: number;
+	/** Enabled plugins whose directory is one of the project index roots. */
+	indexed: number;
+	/** Enabled in this project, in no index root — the rebuild/pluginAreas bucket. */
+	enabledNotIndexed: { name: string; kind: EnablementKind; via?: string; chain: string[] }[];
+	/** In no enabled set at all: neither referenced nor declared by an enabled plugin. */
+	unreferenced: string[];
+}
+
+export function pluginCoverage(workspace: Workspace): PluginCoverage {
+	const engine = workspace.plugins.filter((plugin) => plugin.source === "Engine");
+	const roots = new Set(workspace.pluginDirs.map((dir) => normalizePath(dir).toLowerCase()));
+	const enablement = workspace.enablement;
+	/* Hand-built workspaces (tests, callers that skip plugin resolution) have no closure: fall back to
+	   "referenced" plus `EnabledByDefault`, which is what the descriptors alone can prove. */
+	const known = (plugin: PluginSummary) =>
+		enablement ? enablement.byName.get(plugin.name.toLowerCase()) : plugin.enabledByDefault ? { plugin, kind: "default" as EnablementKind, chain: [`EnabledByDefault:${plugin.name}`], depth: 0 } : workspace.pluginRefs.some((ref) => ref.status !== "disabled" && ref.name.toLowerCase() === plugin.name.toLowerCase()) ? { plugin, kind: "reference" as EnablementKind, chain: [`uproject:${plugin.name}`], depth: 0 } : undefined;
+	const coverage: PluginCoverage = { enginePlugins: engine.length, referenced: 0, defaultEnabled: 0, transitive: 0, indexed: 0, enabledNotIndexed: [], unreferenced: [] };
+	for (const plugin of engine) {
+		const entry = known(plugin);
+		if (!entry) {
+			coverage.unreferenced.push(plugin.name);
+			continue;
+		}
+		if (entry.kind === "reference") coverage.referenced++;
+		else if (entry.kind === "default") coverage.defaultEnabled++;
+		else coverage.transitive++;
+		if (roots.has(normalizePath(plugin.dir).toLowerCase())) coverage.indexed++;
+		else coverage.enabledNotIndexed.push({ name: plugin.name, kind: entry.kind, ...(entry.via ? { via: entry.via } : {}), chain: entry.chain });
 	}
-	return { enginePlugins: workspace.plugins.filter((plugin) => plugin.source === "Engine").length, referenced: referenced.size, names: [...seen.keys()].sort() };
+	coverage.unreferenced.sort();
+	coverage.enabledNotIndexed.sort((a, b) => a.name.localeCompare(b.name));
+	return coverage;
 }
 
 function coverageLines(coverage: Coverage[]): string[] {
@@ -545,6 +613,42 @@ export function headerLookup(input: { name: string; workspace: Workspace; header
 }
 
 /**
+ * Resolve `pluginAreas` entries — plugin name (`PhysicsControl`), `Category/Plugin`, or
+ * `Plugins/Category/Plugin` — to plugin directories for project index roots.
+ *
+ * One plugin's sources are seconds; `engineAreas ["Plugins"]` is every plugin in the engine and a
+ * different index key, so the project index cannot answer from it.
+ */
+export function resolvePluginAreaDirs(workspace: Workspace, areas: string[] | undefined): { dirs: string[]; unresolved: string[] } {
+	const dirs: string[] = [];
+	const unresolved: string[] = [];
+	if (!areas?.length) return { dirs, unresolved };
+	const pluginsRoot = normalizePath(joinPath(workspace.engineRoot ?? "", "Engine/Plugins")).toLowerCase();
+	const known = new Set(workspace.pluginDirs.map((dir) => normalizePath(dir).toLowerCase()));
+	for (const raw of areas) {
+		const label = normalizePath(raw.trim().replace(/^[/\\]+/, "")).toLowerCase().replace(/^plugins\//, "");
+		if (!label) continue;
+		const named = workspace.plugins.find((plugin) => plugin.name.toLowerCase() === label);
+		const plugin =
+			named ??
+			workspace.plugins.find((entry) => {
+				const dir = normalizePath(entry.dir).toLowerCase();
+				const relative = dir.startsWith(`${pluginsRoot}/`) ? dir.slice(pluginsRoot.length + 1) : dir;
+				return relative === label || relative.endsWith(`/${label}`);
+			});
+		if (!plugin) {
+			unresolved.push(raw);
+			continue;
+		}
+		const dir = normalizePath(plugin.dir);
+		if (known.has(dir.toLowerCase())) continue;
+		known.add(dir.toLowerCase());
+		dirs.push(dir);
+	}
+	return { dirs, unresolved };
+}
+
+/**
  * A 0-row answer for `<Type>:<Member>_Implementation` is a UHT fact, not a miss (field-findings
  * 2026-10-28 §8). `IMoverInputProducerInterface:ProduceInput_Implementation` returns nothing because
  * UnrealHeaderTool generates `_Implementation` members on the *implementers*, never on the interface
@@ -584,14 +688,31 @@ export function zeroResultNotes(input: { query: string; scope: Scope; workspace:
 
 	const wantsEngine = input.scope === "engine" || input.scope === "all";
 	if (input.workspace.engineRoot) {
-		// Printed for every 0-row answer, not just engine scope: a type that lives in an engine plugin the
-		// project does not reference is missing from the project index too, and that is precisely the
-		// case where "the engine has no such type" is wrong.
-		const gap = unreferencedEnginePlugins(input.workspace);
-		notes.push(`engine plugins on disk: ${gap.enginePlugins}, referenced by this .uproject: ${gap.referenced}; index roots cover referenced plugins only (this answer's scope was "${input.scope}")`);
-		notes.push(`a plugin the project does not reference is in no index root: pass scope "engine" with engineAreas ["Plugins"] (every Engine/Plugins source) or ["Plugins/<Category>/<Plugin>"] for one plugin`);
-		const near = rankNamesByQuery(gap.names, input.query);
-		if (near.length) notes.push(`unreferenced engine plugins whose name matches the query: ${near.slice(0, 6).join(", ")}${gap.names.length > 6 ? ` (of ${gap.names.length} unreferenced engine plugins with sources here)` : ""}`);
+		// Printed for every 0-row answer, not just engine scope: a type that lives in an engine plugin no
+		// index root covers is missing at every scope, and that is precisely the case where "the engine
+		// has no such type" is wrong. Buckets come from the enablement closure, so "not referenced"
+		// never reads as "not loaded" again.
+		const gap = pluginCoverage(input.workspace);
+		notes.push(
+			`engine plugins on disk: ${gap.enginePlugins}; enabled in this project: ${gap.referenced} referenced by the .uproject + ${gap.defaultEnabled} EnabledByDefault + ${gap.transitive} declared by an enabled plugin; project index roots cover ${gap.indexed} of them, ${gap.unreferenced.length} are enabled by nothing (this answer's scope was "${input.scope}")`,
+		);
+		const nearEnabled = rankNamesByQuery(gap.enabledNotIndexed.map((entry) => entry.name), input.query);
+		const nearUnreferenced = rankNamesByQuery(gap.unreferenced, input.query);
+		const describe = (entry: { name: string; kind: EnablementKind; via?: string }) => (entry.kind === "dependency" ? `${entry.name} (declared by ${entry.via})` : `${entry.name} (${entry.kind === "default" ? "EnabledByDefault" : "referenced"})`);
+		if (nearEnabled.length) {
+			const matching = gap.enabledNotIndexed.filter((entry) => nearEnabled.includes(entry.name));
+			notes.push(`enabled in this project but in no index root: ${matching.slice(0, 6).map(describe).join(", ")}${gap.enabledNotIndexed.length > 6 ? ` (of ${gap.enabledNotIndexed.length} enabled plugins outside the roots)` : ""}`);
+			notes.push(`next for those: unreal_index action "build" scope "project" (project roots now take referenced plugins plus what they declare) or pluginAreas ["${matching[0]!.name}"]`);
+		} else if (gap.enabledNotIndexed.length) {
+			notes.push(`${gap.enabledNotIndexed.length} plugin(s) this project loads are in no index root (e.g. ${gap.enabledNotIndexed.slice(0, 4).map(describe).join(", ")}); a pluginAreas entry naming one adds it`);
+		}
+		if (nearUnreferenced.length) {
+			notes.push(`engine plugins nothing enables whose name matches the query: ${nearUnreferenced.slice(0, 6).join(", ")}${gap.unreferenced.length > 6 ? ` (of ${gap.unreferenced.length} not enabled here)` : ""}`);
+			notes.push(`next for those: scope "engine" with engineAreas ["Plugins"] (every Engine/Plugins source) or ["Plugins/<Category>/<Plugin>"] for one plugin — or a .uproject reference with Enabled true when the project should load it`);
+		}
+		if (!nearEnabled.length && !nearUnreferenced.length) {
+			notes.push(`no plugin name matches '${input.query}', and plugin sets are the only thing the roots leave out: engineAreas ["Plugins/<Category>/<Plugin>"] (one plugin, seconds) or engineAreas ["Plugins"] (all of Engine/Plugins, minutes) scans that plugin's sources without touching the .uproject`);
+		}
 		notes.push(input.header ? `header index ${input.header.key} covers ${rootKindsNote(input.header.meta.roots, { engineRoot: input.header.meta.engineRoot })}` : `asking whether a header exists is a path question, not a symbol question: unreal_index action "headers" (path walk only, seconds) answers it from ${input.workspace.engineRoot}/Engine/Plugins and Engine/Source`);
 		if (!wantsEngine) notes.push("the project index does not scan engine sources at all: pass scope \"engine\" (first build takes minutes) or scope \"all\" for engine declarations");
 	} else if (!wantsEngine) {
@@ -638,6 +759,8 @@ export interface SymbolLookupInput {
 	engineAreas?: string[];
 	/** Opt in to a minutes-long first engine build. Default false: the tool says how, it never stalls. */
 	allowEngineBuild?: boolean;
+	/** Extra engine plugins for the project roots: `"PhysicsControl"` or `"Plugins/Animation/PhysicsControl"`. */
+	pluginAreas?: string[];
 	onProgress?: (message: string) => void;
 	fs?: FsAdapter;
 	deps?: ResolverDeps;
@@ -648,7 +771,7 @@ export async function symbolLookup(input: SymbolLookupInput) {
 	const fs = input.fs ?? realFs;
 	const notes: string[] = [];
 	const warnings: string[] = [];
-	const workspace = await resolveWorkspace(input.cwd, fs, input.deps);
+	const workspace = await resolveWorkspace(input.cwd, fs, input.deps, { pluginAreas: input.pluginAreas });
 	const scope: Scope = input.scope ?? (input.includeEngine ? "all" : "project");
 	const limit = input.limit ?? 25;
 	const indexes: { key: string; scope: Scope; defs: number; files: number; generatedAt: number }[] = [];
@@ -727,6 +850,8 @@ export interface SymbolListInput {
 	limit?: number;
 	engineAreas?: string[];
 	allowEngineBuild?: boolean;
+	/** Extra engine plugins for the project roots: `"PhysicsControl"` or `"Plugins/Animation/PhysicsControl"`. */
+	pluginAreas?: string[];
 	fs?: FsAdapter;
 	deps?: ResolverDeps;
 }
@@ -734,7 +859,7 @@ export interface SymbolListInput {
 /** Prefix listing — cheap, and the way to discover `FX`/`U`/`A` families. */
 export async function symbolList(input: SymbolListInput) {
 	const fs = input.fs ?? realFs;
-	const workspace = await resolveWorkspace(input.cwd, fs, input.deps);
+	const workspace = await resolveWorkspace(input.cwd, fs, input.deps, { pluginAreas: input.pluginAreas });
 	const scope: Scope = input.scope ?? "project";
 	const notes: string[] = [];
 	const project = await ensureIndex({ workspace, mode: "definitions", scope: "project", engineAreas: input.engineAreas, fs });
@@ -917,7 +1042,7 @@ export async function fileContext(input: FileContextInput): Promise<FileContextR
 	let choice: TargetChoice | undefined;
 	if (mode === "full") {
 		choice = pickTarget({ cwd: input.cwd, engineRoot: workspace.engineRoot, fs });
-		const ensured = await ensureQueryJson({ cacheRoot: cacheDir(fs), choice, engineRoot: workspace.engineRoot, fs, onStdout: input.onProgress });
+		const ensured = await ensureQueryJson({ cacheRoot: cacheDir(fs), choice, engineRoot: workspace.engineRoot, projectPath: workspace.projectPath, fs, onStdout: input.onProgress });
 		queryFiles = ensured.source === "missing" ? undefined : ensured.paths;
 		notes.push(...ensured.notes);
 		warnings.push(...ensured.warnings);
@@ -1007,30 +1132,67 @@ export interface ModuleAvailability {
 	pluginSource?: PluginSummary["source"];
 	enabledByDefault?: boolean;
 	referencedInUproject: boolean;
+	/** Why the plugin is loaded when that is not a `.uproject` reference (`computeEnablementClosure`). */
+	enablement?: { kind: EnablementKind; via?: string; chain: string[] };
 	notes: string[];
 }
 
 /**
- * Is this module usable here? Two independent facts the `.uproject` alone cannot answer:
- * `TargetModuleReferences` says whether the target's graph compiles the module at all, and the plugin
- * descriptor says who owns it and whether it loads without a reference (`EnabledByDefault`).
+ * Is this module usable here? Three independent facts the `.uproject` alone cannot answer:
+ * `TargetModuleReferences` says whether the target's graph compiles the module at all, the plugin
+ * descriptor says who owns it, and the enablement closure says why it loads — a reference,
+ * `EnabledByDefault`, or a `Plugins[]` declaration by another enabled plugin.
+ *
+ * The last one is what the 2026-11-11 session got wrong: `PhysicsControl` is mounted because
+ * `AnimatorKit` (EnabledByDefault) declares it, and answering "needs a .uproject reference" for a
+ * plugin the editor had already loaded sends the reader to edit a file that needs no edit.
  */
 export function moduleAvailability(input: { workspace: Workspace; moduleRefs: Map<string, UbtModuleRefs>; moduleName: string; target: string }): ModuleAvailability {
 	const { workspace, moduleRefs, moduleName, target } = input;
 	const refs = moduleRefs.get(moduleName);
 	const plugin = (refs?.moduleDirectory ? workspace.plugins.find((entry) => isUnder(refs.moduleDirectory, entry.dir)) : undefined) ?? workspace.plugins.find((entry) => entry.modules.some((module) => module.moduleName === moduleName));
 	const declared = plugin?.modules.find((module) => module.moduleName === moduleName);
-	const referenced = plugin ? workspace.pluginRefs.some((ref) => ref.name.toLowerCase() === plugin.name.toLowerCase()) : false;
+	const enabled = plugin ? workspace.enablement?.byName.get(plugin.name.toLowerCase()) : undefined;
+	const referenced = enabled
+		? enabled.kind === "reference"
+		: plugin
+			? workspace.pluginRefs.some((ref) => ref.status !== "disabled" && ref.name.toLowerCase() === plugin.name.toLowerCase())
+			: false;
 	const type = refs?.type || declared?.type;
 	const notes: string[] = [`  in ${target} module graph: ${refs ? `yes (${refs.moduleDirectory})` : "no — TargetModuleReferences has no entry for it"}`];
 	if (plugin) {
 		notes.push(`  owning plugin ${plugin.name} [${plugin.source}] · declared module Type ${type ?? "unset"}`);
-		notes.push(`  .uproject reference: ${plugin.source === "Engine" ? (referenced ? "referenced" : "NOT referenced") : "not an engine-plugin reference"}`);
-		if (!referenced) notes.push(plugin.enabledByDefault ? "  EnabledByDefault true: it loads with no .uproject reference" : "  EnabledByDefault false: runtime use needs a .uproject reference with Enabled true");
+		if (plugin.source === "Engine") notes.push(`  .uproject reference: ${referenced ? "referenced" : "NOT referenced"}`);
+		else notes.push("  plugin source: not an engine plugin (project/mod/external, no .uproject reference needed)");
+		if (!referenced) notes.push(...enablementNotes(workspace, plugin, enabled));
 	} else {
 		notes.push("  no .uplugin declares this module (engine source module, project module, or a name the graph does not contain)");
 	}
-	return { module: moduleName, target, inTargetGraph: Boolean(refs), directory: refs?.moduleDirectory, type, plugin: plugin?.name, pluginSource: plugin?.source, enabledByDefault: plugin?.enabledByDefault, referencedInUproject: referenced, notes };
+	return {
+		module: moduleName,
+		target,
+		inTargetGraph: Boolean(refs),
+		directory: refs?.moduleDirectory,
+		type,
+		plugin: plugin?.name,
+		pluginSource: plugin?.source,
+		enabledByDefault: plugin?.enabledByDefault,
+		referencedInUproject: referenced,
+		...(enabled && enabled.kind !== "reference" ? { enablement: { kind: enabled.kind, ...(enabled.via ? { via: enabled.via } : {}), chain: enabled.chain } } : {}),
+		notes,
+	};
+}
+
+/** One line that says *why* an unreferenced plugin still loads — or that nothing enables it. */
+function enablementNotes(workspace: Workspace, plugin: PluginSummary, enabled: PluginEnablement | undefined): string[] {
+	if (enabled?.kind === "default") return [`  EnabledByDefault true: it loads with no .uproject reference (chain ${enabled.chain.join(" <- ")})`];
+	if (enabled?.kind === "dependency") {
+		const viaDefault = enabled.chain[0]?.startsWith("EnabledByDefault:") ?? false;
+		return [`  Enabled transitively: ${enabled.via}${viaDefault ? " (EnabledByDefault)" : ""} declares ${plugin.name} — it is loaded, no .uproject reference needed (chain ${enabled.chain.join(" <- ")})`];
+	}
+	if (plugin.enabledByDefault) return ["  EnabledByDefault true: it loads with no .uproject reference"];
+	if (workspace.enablement) return ["  EnabledByDefault false, no .uproject reference, no enabled plugin declares it: runtime use needs a .uproject reference with Enabled true"];
+	return ["  EnabledByDefault false and the .uproject does not reference it; plugin enablement was not computed for this workspace"];
 }
 
 export interface BuildContextInput {
@@ -1064,7 +1226,7 @@ export async function buildContext(input: BuildContextInput) {
 	const notes: string[] = [`target ${choice.target} ${choice.platform} ${choice.configuration} (derived from ${choice.source})`];
 	const warnings: string[] = [...before.notes];
 
-	const ensured = await ensureQueryJson({ cacheRoot: root, choice, engineRoot: workspace.engineRoot, refresh: input.refresh, fs, onStdout: input.onProgress });
+	const ensured = await ensureQueryJson({ cacheRoot: root, choice, engineRoot: workspace.engineRoot, projectPath: workspace.projectPath, refresh: input.refresh, fs, onStdout: input.onProgress });
 	notes.push(...ensured.notes);
 	warnings.push(...ensured.warnings);
 	if (!ensured.paths) return { target: choice, notes, warnings, error: "UnrealBuildTool Query produced no JSON; inspect the notes for the spawn failure" };
@@ -1157,7 +1319,11 @@ export function indexStatus(cwd: string, fs: FsAdapter = realFs, workspace?: Wor
 	];
 	if (workspace) {
 		const sets = currentRootSets(workspace, { fs });
-		notes.push(`current lookup root sets: engine scope = ${sets.engine.length} root(s) (engineAreas ${sets.engineAreas.join(", ")}, keyed by engineRoot+areas, not by project plugin roots); project scope = ${sets.project.length} root(s) (project sources + ${workspace.pluginDirs.length} enabled plugin root(s))`);
+		notes.push(`current lookup root sets: engine scope = ${sets.engine.length} root(s) (engineAreas ${sets.engineAreas.join(", ")}, keyed by engineRoot+areas, not by project plugin roots); project scope = ${sets.project.length} root(s) (project sources + ${workspace.pluginDirs.length} engine plugin root(s))`);
+		if (workspace.enablement) {
+			const closure = workspace.enablement;
+			notes.push(`plugin enablement: ${closure.referenced.length} referenced by the .uproject + ${closure.dependencies.length} declared by an enabled plugin (project index roots) + ${closure.defaultEnabled.length} EnabledByDefault (loaded, no root unless pluginAreas names one) — unreal_symbol/unreal_index pluginAreas "<Plugin>" adds one in seconds, engineAreas ["Plugins"] scans them all in minutes`);
+		}
 		const orphaned = indexes.filter((index) => index.scope === "Engine" && !index.selectedByLookups);
 		for (const index of orphaned) notes.push(`near miss: index ${index.key} (${index.defs?.toLocaleString() ?? "?"} symbols, ${Number.isFinite(index.sizeMb) ? index.sizeMb.toFixed(1) : "?"} MB) is keyed by its root set — 1.2 keys engine scope by (engineRoot, engineAreas), so no lookup selects it; the key current lookups ask for is ${index.expectedKey}. Rebuild with unreal_index action "build" scope engine (minutes), then unreal_index action prune`);
 	}
@@ -1201,6 +1367,8 @@ export interface IndexBuildInput {
 	scope: Exclude<Scope, "all">;
 	mode: Mode;
 	engineAreas?: string[];
+	/** Extra engine plugins for the project roots: `"PhysicsControl"` or `"Plugins/Animation/PhysicsControl"`. */
+	pluginAreas?: string[];
 	target?: string;
 	platform?: string;
 	configuration?: string;
@@ -1216,7 +1384,7 @@ export interface IndexBuildInput {
  */
 export async function indexBuild(input: IndexBuildInput) {
 	const fs = input.fs ?? realFs;
-	const workspace = await resolveWorkspace(input.cwd, fs, input.deps);
+	const workspace = await resolveWorkspace(input.cwd, fs, input.deps, { pluginAreas: input.pluginAreas });
 	const notes: string[] = [];
 	let queryFiles: CachePaths | undefined;
 
@@ -1232,7 +1400,7 @@ export async function indexBuild(input: IndexBuildInput) {
 			const choice = pickTarget({ cwd: input.cwd, target: input.target, platform: input.platform, configuration: input.configuration, engineRoot: workspace.engineRoot, fs });
 			const cached = queryCacheState(cacheDir(fs), choice, fs);
 			if (input.mode === "full") {
-				const ensured = await ensureQueryJson({ cacheRoot: cacheDir(fs), choice, engineRoot: workspace.engineRoot, refresh: input.refresh, fs, onStdout: input.onProgress });
+				const ensured = await ensureQueryJson({ cacheRoot: cacheDir(fs), choice, engineRoot: workspace.engineRoot, projectPath: workspace.projectPath, refresh: input.refresh, fs, onStdout: input.onProgress });
 				notes.push(...ensured.notes);
 				queryFiles = ensured.paths;
 			} else if (cached.usable) {

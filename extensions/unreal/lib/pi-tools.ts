@@ -35,6 +35,12 @@ const EngineAreasSchema = Type.Optional(
 		description: 'Engine scan dials, rooted at the engine install. Engine/Source areas: ["Runtime"] (default, DEFAULT_ENGINE_AREAS in lib/store.ts), ["Editor"], ["Runtime/Core"]. Engine-plugin areas: ["Plugins"] = every Engine/Plugins source tree (~2.8x the Runtime scan — this is where Mover, PoseSearch, PhysicsControl, BlendStack, SmartObjects, StateTree and GameplayAbilities live) or one subtree, e.g. ["Plugins/Animation/PhysicsControl"]. Engine-scope indexes always include the plugin roots the .uproject enables; these areas add the rest.',
 	}),
 );
+const PluginAreasSchema = Type.Optional(
+	Type.Array(Type.String(), {
+		description:
+			'Extra engine plugins to add to the PROJECT index roots — the dial for a plugin this project loads without a .uproject reference, or one it should index anyway. A plugin name ("PhysicsControl", "Animation/PhysicsControl") or its Engine/Plugins area ("Plugins/Animation/PhysicsControl") — seconds per plugin, no engine scan, and the project index keeps answering the same way. Prefer this over engineAreas ["Plugins"] (every plugin in the engine, minutes) and over adding a .uproject reference (which changes the project).',
+	}),
+);
 const LimitSchema = Type.Optional(Type.Number({ description: "Maximum rows to return. Default 25." }));
 const TargetSchema = Type.Optional(Type.String({ description: "UBT target whose compile environment to report, e.g. 'LpEditor', 'UnrealEditor'. Default: the project's editor target." }));
 const PlatformSchema = Type.Optional(Type.String({ description: "Target platform. Default: this machine's platform (Win64 on Windows)." }));
@@ -49,6 +55,7 @@ const SymbolParams = Type.Object({
 	owner: Type.Optional(Type.String({ description: "Owner type for a member lookup: query 'Tick' + owner 'AActor'. A bare method name is resolved through its owner." })),
 	scope: ScopeSchema,
 	engineAreas: EngineAreasSchema,
+	pluginAreas: PluginAreasSchema,
 	module: Type.Optional(Type.String({ description: "Restrict hits to one module, e.g. 'Engine'." })),
 	prefix: Type.Optional(Type.Boolean({ description: "Allow prefix matching (name families, typos). Default false: exact + qualified-member only." })),
 	substring: Type.Optional(Type.Boolean({ description: "Allow substring matching: a linear scan of the definition table (rank 3, listed after exact/prefix hits). Finds qualified members like 'PhysicsControlBPLibrary:Enable' from a bare 'Enable'. Costs ~0.3s per 76 MB of rows. Default false." })),
@@ -60,6 +67,7 @@ const ListParams = Type.Object({
 	prefix: Type.String({ description: "Symbol-name prefix, e.g. 'ULp' or 'ANiMy'." }),
 	scope: ScopeSchema,
 	engineAreas: EngineAreasSchema,
+	pluginAreas: PluginAreasSchema,
 	kind: Type.Optional(
 		Type.Union([Type.Literal("class"), Type.Literal("struct"), Type.Literal("enum"), Type.Literal("union"), Type.Literal("function"), Type.Literal("delegate"), Type.Literal("property"), Type.Literal("alias")], {
 			description: "Filter by definition kind.",
@@ -89,6 +97,7 @@ const IndexParams = Type.Object({
 	mode: Type.Optional(Type.Union([Type.Literal("definitions"), Type.Literal("full")], { description: "'definitions' = symbol -> file:line only (default, fast). 'full' also records per-file include sets and needs UnrealBuildTool Query (~7s, no compiler)." })),
 	name: Type.Optional(Type.String({ description: "For action 'headers': the header to answer, e.g. 'MoverState.h', 'PhysicsControlComponent.h', or a partial path 'Mover/Public/MoverTypes.h'. Absent = build/report only." })),
 	engineAreas: EngineAreasSchema,
+	pluginAreas: PluginAreasSchema,
 	target: TargetSchema,
 	platform: PlatformSchema,
 	configuration: ConfigurationSchema,
@@ -213,9 +222,9 @@ export const unrealSymbol = defineTool({
 	promptSnippet: "Locate a UE C++ symbol definition (project, plugins, engine) with module attribution",
 	promptGuidelines: [
 		"Use unreal_symbol instead of grepping Engine/Source for a class or function name: grep returns every file that mentions the name (a hot engine class is ~176 files / 150 KB of context); this returns definition lines only.",
-		"Default scope is 'project' (project modules + enabled plugins). Engine types (AActor, UAnimInstance, FWorldDelegates) need scope 'engine', which requires an engine index: unreal_index action build scope engine — minutes the first time, cached afterwards, engineAreas [\"Runtime\"] keeps it to the engine's own sources. An engine index covers Engine/Source areas plus the plugin roots the .uproject enables; types shipped by plugins the project does NOT reference (PhysicsControl, BlendStack, StateTree, GameplayAbilities...) need engineAreas [\"Plugins\"].",
+		"Default scope is 'project': the project's modules plus every plugin the project loads — .uproject references, EnabledByDefault plugins, and what those declare, plus the plugins any .uproject reference declares (BlendStack via Chooser, PhysicsControl via AnimatorKit). Engine types (AActor, UAnimInstance, FWorldDelegates) need scope 'engine': unreal_index action build scope engine, minutes the first time, cached afterwards, engineAreas [\"Runtime\"] keeps it to the engine's own sources. For a specific plugin the project still does not cover, add it to the project index with pluginAreas [\"PhysicsControl\"] (seconds) before reaching for engineAreas [\"Plugins\"] (~2.8x, minutes).",
 		"Qualify member lookups: query 'Tick' with owner 'AActor', or query 'AActor:Tick'. Use prefix: true for name families ('ULp', 'ANiMy') and substring: true for qualified members ('Enable' finds 'UPhysicsControlBPLibrary:Enable'), never to silently accept a typo.",
-		"A 0-row answer is a statement about the roots that were scanned, not about the engine: read the coverage lines it prints. Asking whether a header exists in this engine version is a path question — use unreal_index action 'headers' name 'X.h', not a symbol lookup.",
+		"A 0-row answer is a statement about the roots that were scanned, not about the engine: it counts the plugins the project loads (referenced / EnabledByDefault / declared by an enabled plugin), says which of them the index roots cover, and names the next call. A plugin it calls 'enabled in this project but in no index root' is loaded, not missing — pluginAreas [\"<Plugin>\"] indexes it. Asking whether a header exists in this engine version is a path question — use unreal_index action 'headers' name 'X.h', not a symbol lookup.",
 		"Each row carries the declaration line's own text under it, so a hit usually needs no follow-up read; open the file only when you need surrounding context.",
 		"A definition line is a starting point, not an answer: read that file at that line. For engine call graphs clangd (MCP) is more precise; for module/link facts use unreal_context.",
 	],
@@ -226,7 +235,7 @@ export const unrealSymbol = defineTool({
 
 	async execute(_id, params, _signal, _update, ctx) {
 		const query = params.owner ? `${params.owner}:${params.query}` : params.query;
-		const out = await symbolLookup({ cwd: params.cwd ?? ctx.cwd, query, scope: params.scope as Scope | undefined, engineAreas: params.engineAreas, module: params.module, prefix: params.prefix, substring: params.substring, limit: params.limit, fs: realFs });
+		const out = await symbolLookup({ cwd: params.cwd ?? ctx.cwd, query, scope: params.scope as Scope | undefined, engineAreas: params.engineAreas, pluginAreas: params.pluginAreas, module: params.module, prefix: params.prefix, substring: params.substring, limit: params.limit, fs: realFs });
 		const rows = out.results.map((row) => rowLine(row, params.cwd ?? ctx.cwd));
 		const text = [`unreal_symbol '${query}' scope=${out.scope}: ${out.total} definition(s)`, ...rows, ...out.notes.map((n) => `· ${n}`), ...(out.warnings ?? []).map((w) => `! ${w}`)].join("\n");
 		return result(text, out, out.total === 0);
@@ -248,7 +257,7 @@ export const unrealSymbolList = defineTool({
 	executionMode: "parallel",
 
 	async execute(_id, params, _signal, _update, ctx) {
-		const out = await symbolList({ cwd: params.cwd ?? ctx.cwd, prefix: params.prefix, scope: params.scope as Scope | undefined, kind: params.kind, module: params.module, engineAreas: params.engineAreas, limit: params.limit ?? 40, fs: realFs });
+		const out = await symbolList({ cwd: params.cwd ?? ctx.cwd, prefix: params.prefix, scope: params.scope as Scope | undefined, kind: params.kind, module: params.module, engineAreas: params.engineAreas, pluginAreas: params.pluginAreas, limit: params.limit ?? 40, fs: realFs });
 		const rows = out.symbols.map((row) => rowLine(row, params.cwd ?? ctx.cwd));
 		const text = [`unreal_symbol_list '${params.prefix}' scope=${out.scope}: ${out.total} symbol(s)`, ...rows, ...out.notes.map((n) => `· ${n}`)].join("\n");
 		return result(text, out);
@@ -346,8 +355,9 @@ export const unrealIndex = defineTool({
 	promptSnippet: "Build/report the UE symbol index, header index, and UBT Query cache",
 	promptGuidelines: [
 		"Run unreal_index action 'status' first: it prints what is cached, how old it is, which root kinds each index covers, and what building will cost. A 0 from a lookup is only meaningful against the index status names — an index key encodes its root set, so an index you did not build is not what was searched.",
-		"An engine-scope build is a minutes-long scan the first time. Ask the user before building it, and prefer engineAreas [\"Runtime\"] over the whole tree when the question is about gameplay base classes; engineAreas [\"Plugins\"] is the dial for plugin-shipped types (~2.8x the Runtime scan), [\"Plugins/Animation/PhysicsControl\"] for one plugin.",
-		"action 'headers' answers 'does this header exist in this engine version': a path walk only (no content read, seconds, cached), scoped by root kind and reporting the owning plugin, its EnabledByDefault and its .uproject status. Invented header names come back as NOT a file path plus the closest real file names, never as types.",
+		"A project-scope build is seconds. Its roots are the plugins the project loads, not just its .uproject references: enabled references plus the plugins those (or an EnabledByDefault plugin) declare. pluginAreas [\"<Plugin>\"] adds one more engine plugin to that root set (seconds, same index family) — reach for engineAreas [\"Plugins\"] (every plugin, ~2.8x the Runtime scan, minutes) only when the question is about the whole plugin tree.",
+		"An engine-scope build is a minutes-long scan the first time. Ask the user before building it, and prefer engineAreas [\"Runtime\"] over the whole tree when the question is about gameplay base classes.",
+		"action 'headers' answers 'does this header exist in this engine version': a path walk only (no content read, seconds, cached), scoped by root kind and reporting the owning plugin, its EnabledByDefault, whether the .uproject references it and how it is enabled. Invented header names come back as NOT a file path plus the closest real file names, never as types.",
 		"mode 'full' runs UnrealBuildTool -Mode=Query (~7s, needs no compiler, and runs in UBT's own Query environment so it cannot collide with a live build) and records include edges; 'definitions' is a text scan only.",
 		"After a rebase, a branch switch, adding a plugin, or an engine version change, rebuild with refresh: true — indexes are keyed by scan-root identity, not by the project name.",
 		"action 'compiledb' is the clangd enrichment path: minutes of UnrealBuildTool work, ~1 GB for the engine scope (project+engine now includes Engine/Plugins sources, which is where plugin .cpp bodies live). Ask the user before running it, pass check: '<file>' to prove the result with clangd --check, and treat the database as machine-local (never committed).",
@@ -514,6 +524,8 @@ const McpParams = Type.Object({
 	section: Type.Optional(Type.String({ description: "dsl: grammar section to print, e.g. 'NODE CALLS', 'STATEMENTS', 'MULTI-EXEC', 'EXPRESSIONS'. Absent = the section index." })),
 	asset: Type.Optional(Type.String({ description: "recipe: asset path, e.g. '/Game/Blueprints/BP_Foo' (the object path as the editor reports it, no extension)." })),
 	entry: Type.Optional(Type.String({ description: "recipe blueprint-behaviour: node title substring to start from, e.g. 'BeginPlay'." })),
+	graph: Type.Optional(Type.String({ description: "recipe: the graph to read or write — a short name ('EventGraph') or a function name ('Set_InteractionTransform'). Recipes pass it to get_graph, because a name is not a graph handle." })),
+	intent: Type.Optional(Type.String({ description: "recipe blueprint-graph-author: what the change should do; becomes the find_node_types type_id filter." })),
 	limit: Type.Optional(Type.Number({ description: "search: maximum hits. Default 12." })),
 	full: Type.Optional(Type.Boolean({ description: "dsl: print the whole grammar instead of the section index (a tool result is line-limited, so prefer 'section')." })),
 	refresh: Type.Optional(Type.Boolean({ description: "Re-describe the toolsets from the running editor even if the cached snapshot is still fresh." })),
@@ -545,7 +557,7 @@ export const unrealMcp = defineTool({
 	promptSnippet: "Resolve an Unreal MCP tool name and its arguments before calling it (any toolset)",
 	promptGuidelines: [
 		"Call unreal_mcp before any editor toolset call: 'describe' returns the exact toolset_name, tool_name and arguments, so a name is never reconstructed from memory.",
-		"For Blueprint work start with action 'recipe' recipe 'blueprint-inspect' — it is the verified read-only order (load_asset, get_parent, list_graphs, list_functions/events/variables, get_default_object, list_properties, read_graph_dsl) and names the dead ends.",
+		"For Blueprint work start with action 'recipe' recipe 'blueprint-inspect' — it is the verified read-only order (load_asset, get_parent, list_graphs, get_graph, list_functions/events/variables, get_default_object, list_properties, get_properties, read_graph_dsl) and names the dead ends. A graph name is not a graph handle: get_graph {graph_name} is what read_graph_dsl and write_graph_dsl take. 'list_functions' is a candidate list (no signature — use recipe 'blueprint-signatures'); 'list_variables' returns names only (types come from the CDO's list_properties schema — recipe 'blueprint-variables').",
 		"For graph authoring use recipe 'blueprint-graph-author'. It is marked [write]: the package emits the call shapes, the caller runs them. Never call write_graph_dsl/save_assets from this package, and never skip the read_graph_dsl capture that precedes the write.",
 		"Before write_graph_dsl, check the script with action 'dsl' code '<DSL>', and read the grammar with action 'dsl' section '<NAME>' instead of reconstructing syntax from memory — the write compiles the Blueprint, so a malformed script is not a no-op.",
 		"A snapshot answer is not a live answer: check the source line. 'source: snapshot' after the editor restarted can be stale — pass refresh: true (or run /unreal-mcp sync) when the tool surface may have changed.",
@@ -814,6 +826,8 @@ export const unrealMcp = defineTool({
 		const values: Record<string, string> = {};
 		if (params.asset) values.asset = params.asset;
 		if (params.entry) values.entry = params.entry;
+		if (params.graph) values.graph = params.graph;
+		if (params.intent) values.intent = params.intent;
 		const rendered = renderRecipe(recipe, snapshot, values);
 		out.missing.push(...rendered.missing);
 		const lines = [sourceLine, rendered.text];

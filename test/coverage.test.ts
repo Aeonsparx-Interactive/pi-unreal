@@ -23,7 +23,10 @@ import {
 	HEADER_VERSION,
 } from "../extensions/unreal/lib/store.ts";
 import { assembleRoots } from "../extensions/unreal/lib/store.ts";
-import { moduleAvailability, scopeForPath, zeroResultNotes, type Workspace } from "../extensions/unreal/lib/tools.ts";
+import { moduleAvailability, pluginCoverage, scopeForPath, zeroResultNotes, type Workspace } from "../extensions/unreal/lib/tools.ts";
+import { computeEnablementClosure } from "../extensions/unreal/lib/plugin-resolver.ts";
+import type { PluginIndex } from "../extensions/unreal/lib/plugin-resolver.ts";
+import type { UprojectDescriptor } from "../extensions/unreal/lib/descriptors.ts";
 
 // Header and symbol indexes write under the machine cache dir; tests must not touch it.
 process.env.PI_UNREAL_CACHE_DIR = mkdtempSync(join(tmpdir(), "pi-unreal-coverage-cache-"));
@@ -105,9 +108,52 @@ const workspace: Workspace = {
 			plugins: [],
 			diagnostics: [],
 		},
+		{
+			// EnabledByDefault, and it declares PhysicsControl: the 2026-11-11 chain
+			// (`PhysicsControl <- AnimatorKit <- EnabledByDefault:AnimatorKit`).
+			name: "AnimatorKit",
+			path: `${ENGINE}/Engine/Plugins/Animation/AnimatorKit/AnimatorKit.uplugin`,
+			dir: `${ENGINE}/Engine/Plugins/Animation/AnimatorKit`,
+			source: "Engine",
+			enabledByDefault: true,
+			canContainContent: false,
+			isBetaVersion: false,
+			installed: true,
+			supportedTargetPlatforms: [],
+			modules: [{ moduleName: "AnimatorKit", type: "Runtime" }],
+			plugins: [{ name: "PhysicsControl", enabled: true, optional: false, activate: false }],
+			diagnostics: [],
+		},
 	],
 	notes: [],
 };
+
+/** The `.uproject` behind this workspace: one reference, no default-disable flag. */
+const descriptor: UprojectDescriptor = {
+	path: `${PROJECT}/FakeGame.uproject`,
+	enterprise: false,
+	disableEnginePluginsByDefault: false,
+	modules: [],
+	plugins: [{ name: "PoseSearch", enabled: true, optional: false, activate: false, supportedTargetPlatforms: [] }],
+	targetPlatforms: [],
+	additionalPluginDirectories: [],
+	additionalRootDirectories: [],
+	knownFields: [],
+	unknownFields: [],
+	diagnostics: [],
+};
+
+workspace.enablement = computeEnablementClosure(
+	descriptor,
+	{
+		additionalDirs: [],
+		scannedDirs: [],
+		scannedFiles: workspace.plugins.length,
+		entries: workspace.plugins,
+		byName: new Map(workspace.plugins.map((plugin) => [plugin.name.toLowerCase(), [plugin]])),
+		builtAtMs: 0,
+	} satisfies PluginIndex,
+);
 
 describe("root kinds (what an index actually covers)", () => {
 	it("classifies project, engine-source and engine-plugin roots", () => {
@@ -224,9 +270,19 @@ describe("the answer a 0-row lookup owes the caller", () => {
 		const text = notes.join("\n");
 		expect(text).toContain("no definitions matched 'UMoverComponent' in scope 'engine'");
 		expect(text).toContain("scanned engine index idx-engine-defs-test");
-		expect(text).toContain("engine plugins on disk: 2, referenced by this .uproject: 1");
+		expect(text).toContain("engine plugins on disk: 3; enabled in this project: 1 referenced by the .uproject + 1 EnabledByDefault + 1 declared by an enabled plugin");
 		expect(text).toContain('engineAreas ["Plugins"]');
 		expect(text).toContain('unreal_index action "headers"');
+	});
+
+	it("names a transitively enabled plugin as loaded, not as missing a .uproject reference", () => {
+		const notes = zeroResultNotes({ query: "UPhysicsControlComponent", scope: "project", workspace, coverage: [{ key: "idx-p2", scope: "project", kinds: "1 project root(s), 1 engine-plugin root(s)", areas: [], roots: 2 }], indexes: [] });
+		const text = notes.join("\n");
+		// PhysicsControl is enabled (AnimatorKit declares it) but no project root carries it: the next
+		// call is a project rebuild / pluginAreas, never "add a .uproject reference".
+		expect(text).toContain("enabled in this project but in no index root: PhysicsControl (declared by AnimatorKit)");
+		expect(text).toContain('pluginAreas ["PhysicsControl"]');
+		expect(text).not.toContain("needs a .uproject reference");
 	});
 
 	it("for a project scope says engine sources were never scanned", () => {
@@ -262,7 +318,26 @@ describe("module availability (§4.2: not referenced is not not available)", () 
 		expect(physics.inTargetGraph).toBe(true);
 		expect(physics.referencedInUproject).toBe(false);
 		expect(physics.notes.join("\n")).toContain("NOT referenced");
-		expect(physics.notes.join("\n")).toContain("EnabledByDefault false");
+		// The field failure: "not referenced" must never read as "not enabled".
+		expect(physics.notes.join("\n")).toContain("Enabled transitively: AnimatorKit (EnabledByDefault) declares PhysicsControl");
+		expect(physics.enablement).toEqual({ kind: "dependency", via: "AnimatorKit", chain: ["EnabledByDefault:AnimatorKit", "AnimatorKit"] });
+	});
+
+	it("reports a plugin nothing enables as needing a reference", () => {
+		const lonely = moduleAvailability({ workspace: { ...workspace, enablement: undefined, pluginRefs: [] }, moduleRefs, moduleName: "PoseSearch", target: "FakeGameEditor Win64 Development" });
+		expect(lonely.referencedInUproject).toBe(false);
+		expect(lonely.notes.join("\n")).toContain("EnabledByDefault false and the .uproject does not reference it");
+	});
+
+	it("counts the three enablement buckets and what the roots cover", () => {
+		const gap = pluginCoverage(workspace);
+		expect(gap.enginePlugins).toBe(3);
+		expect(gap.referenced).toBe(1);
+		expect(gap.defaultEnabled).toBe(1);
+		expect(gap.transitive).toBe(1);
+		expect(gap.indexed).toBe(1);
+		expect(gap.enabledNotIndexed.map((entry) => entry.name)).toEqual(["AnimatorKit", "PhysicsControl"]);
+		expect(gap.unreferenced).toEqual([]);
 	});
 
 	it("says plainly when the graph has no entry at all", () => {

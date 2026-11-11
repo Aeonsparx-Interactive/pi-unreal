@@ -435,8 +435,18 @@ export function describeToolText(tool: McpToolEntry, options: { full?: boolean; 
 	return lines.join("\n");
 }
 
+/**
+ * One argument value as it is rendered into a call shape. Strings carry the caller's text;
+ * numbers and booleans pass through unquoted (`entry_points_only: true`), because a quoted "true" is
+ * a call the editor rejects.
+ */
+export type CallValue = string | number | boolean | string[];
+
+/** Argument values keyed by argument name, for `callSkeleton`. */
+export type CallValues = Record<string, CallValue>;
+
 /** Exact `call_tool` shape, one line per argument so it can be pasted with edits. */
-export function callSkeleton(tool: McpToolEntry, values: Record<string, string | string[]> = {}): string {
+export function callSkeleton(tool: McpToolEntry, values: CallValues = {}): string {
 	const args: Record<string, unknown> = {};
 	for (const arg of tool.args) {
 		const given = values[arg.name];

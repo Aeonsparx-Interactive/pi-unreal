@@ -298,6 +298,127 @@ function parseEngineVersionRaw(raw: string): EngineVersion | undefined {
 	};
 }
 
+/* --------------------------------------------------------------------------
+ * Enablement closure.
+ *
+ * "Is this plugin available?" is not a question about the `.uproject`. The engine loads a plugin
+ * that is (a) referenced with `Enabled: true`, (b) `EnabledByDefault: true`, or (c) declared in the
+ * `Plugins[]` list of a plugin it already loaded (`PluginManager.cpp`, `PluginDescriptor.cpp`). The
+ * field session on UE 5.8 hit exactly this: `PhysicsControl` was mounted (`LogPluginManager: Mounting
+ * Engine plugin PhysicsControl`) because `AnimatorKit` (EnabledByDefault) declares it, and
+ * `BlendStack` because `Chooser` declares it — while the tooling answered "needs a .uproject
+ * reference" and returned 0 symbol rows for types the running editor had loaded.
+ *
+ * The closure below is the same walk a two-seed BFS produces (seeds: enabled `.uproject` references +
+ * every `EnabledByDefault` plugin; edges: each loaded plugin's `Plugins[]`, `Enabled` defaulting to
+ * true). It records the shortest enabling chain per plugin, because "enabled somehow" is not an
+ * answer a reader can act on.
+ * ------------------------------------------------------------------------- */
+
+export type EnablementKind = "reference" | "default" | "dependency";
+
+export interface PluginEnablement {
+	/** The winning descriptor — the copy the engine would load. */
+	plugin: PluginSummary;
+	/** Why it is loaded. */
+	kind: EnablementKind;
+	/** For `dependency`: the plugin whose `Plugins[]` declares this one. */
+	via?: string;
+	/** Enabling chain, seed first: `["uproject:Chooser", "Chooser"]`, `["EnabledByDefault:AnimatorKit", "AnimatorKit"]`. */
+	chain: string[];
+	/** 0 for a seed, 1 for a plugin a seed declares, and so on. */
+	depth: number;
+}
+
+export interface EnablementClosure {
+	/** Lowercased plugin name → how it is enabled. */
+	byName: Map<string, PluginEnablement>;
+	/** Resolved `.uproject` references with `Enabled: true`. */
+	referenced: PluginSummary[];
+	/** `EnabledByDefault: true` plugins the `.uproject` does not reference. */
+	defaultEnabled: PluginSummary[];
+	/** Plugins loaded only because an enabled plugin declares them. */
+	dependencies: PluginSummary[];
+}
+
+/**
+ * Walk the enablement closure for one project. Bounded by the plugin index (one pass per plugin).
+ *
+ * `edges` are skipped when a declared dependency says `Enabled: false`; a missing dependency
+ * (`Optional: true` typically) is skipped silently, exactly as the engine tolerates it.
+ */
+export function computeEnablementClosure(descriptor: UprojectDescriptor, index: PluginIndex): EnablementClosure {
+	const byName = new Map<string, PluginEnablement>();
+	const queue: PluginEnablement[] = [];
+	const enable = (plugin: PluginSummary, kind: EnablementKind, chain: string[], via?: string): PluginEnablement | undefined => {
+		const key = plugin.name.toLowerCase();
+		const existing = byName.get(key);
+		if (existing) return existing;
+		const entry: PluginEnablement = { plugin, kind, chain, depth: chain.length - 1, ...(via ? { via } : {}) };
+		byName.set(key, entry);
+		queue.push(entry);
+		return entry;
+	};
+
+	// Seeds 1: enabled `.uproject` references. `Enabled: false` disables the plugin AND its edges.
+	for (const ref of descriptor.plugins) {
+		if (!ref.enabled) continue;
+		const winner = index.byName.get(ref.name.toLowerCase())?.[0];
+		if (!winner) continue;
+		enable(winner, "reference", [`uproject:${ref.name}`]);
+	}
+	// Seeds 2: EnabledByDefault. This is the bulk (~300 plugins on a 5.8 install), which is why the
+	// index-root policy below only takes their direct dependencies. `DisableEnginePluginsByDefault`
+	// turns engine-plugin default enablement off (`FPluginManager::ConfigureEnabledPlugins`), so those
+	// seeds disappear while project/mod/external defaults stay.
+	for (const plugin of index.entries) {
+		if (!plugin.enabledByDefault) continue;
+		if (descriptor.disableEnginePluginsByDefault && plugin.source === "Engine") continue;
+		enable(plugin, "default", [`EnabledByDefault:${plugin.name}`]);
+	}
+
+	for (let cursor = 0; cursor < queue.length; cursor++) {
+		const current = queue[cursor]!;
+		for (const declared of current.plugin.plugins) {
+			if (!declared.enabled) continue;
+			const winner = index.byName.get(declared.name.toLowerCase())?.[0];
+			if (!winner) continue;
+			enable(winner, "dependency", [...current.chain, current.plugin.name], current.plugin.name);
+		}
+	}
+
+	const all = [...byName.values()];
+	return {
+		byName,
+		referenced: all.filter((entry) => entry.kind === "reference").map((entry) => entry.plugin),
+		defaultEnabled: all.filter((entry) => entry.kind === "default").map((entry) => entry.plugin),
+		dependencies: all.filter((entry) => entry.kind === "dependency").map((entry) => entry.plugin),
+	};
+}
+
+/**
+ * Plugins a project index should scan by default: the `.uproject` references plus the plugins those
+ * (or an `EnabledByDefault` plugin) declare directly.
+ *
+ * Why not the whole closure: the closure's `EnabledByDefault` bulk is hundreds of plugins and
+ * tens of thousands of files — indexing it by default is the `engineAreas ["Plugins"]` cost the
+ * tooling exists to avoid. Why the direct dependencies at all: those are the plugins that make a
+ * "0 rows" answer wrong for a type the editor has loaded (`BlendStack` via `Chooser`,
+ * `PhysicsControl` via `AnimatorKit`). Anything deeper is a deliberate opt-in (`pluginAreas`).
+ */
+export function enablementIndexRoots(closure: EnablementClosure): PluginSummary[] {
+	const roots: PluginSummary[] = [...closure.referenced];
+	const seen = new Set(roots.map((plugin) => plugin.name.toLowerCase()));
+	for (const entry of closure.byName.values()) {
+		if (entry.kind !== "dependency" || entry.chain.length !== 2) continue;
+		const key = entry.plugin.name.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		roots.push(entry.plugin);
+	}
+	return roots;
+}
+
 /** Stable cache key inputs for an index build. */
 export function indexSignature(index: PluginIndex): string {
 	const parts = [index.engineRoot ?? "-", index.projectDir ?? "-", index.scannedDirs.join(","), String(index.entries.length)];
