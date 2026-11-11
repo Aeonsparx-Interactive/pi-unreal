@@ -50,6 +50,7 @@ import {
 	zeroResultUhtNotes,
 } from "../extensions/unreal/lib/tools.ts";
 import { normalizePath, realFs } from "../extensions/unreal/lib/util.ts";
+import { hostPlatform } from "../extensions/unreal/lib/ubt.ts";
 
 /**
  * Acceptance tests for the 2026-10-28 session report (`tmp/reports/field-findings-2026-10-28.md`).
@@ -463,6 +464,13 @@ utimesSync(LIVE_DB, STALE_DB, STALE_DB);
 	});
 
 	it("the compiledb report names the live directory, the TU coverage, and the no-link-check pointer", async () => {
+		// The report REUSES a database instead of generating one (generation costs minutes, and a fixture
+		// engine ships no UnrealBuildTool). Key it the way ensureCompileDb does — target.platform.config —
+		// driven by hostPlatform(), so the reuse holds on every platform instead of only where a sibling
+		// test happened to leave a Win64-keyed file behind.
+		const key = `GameEditor.${hostPlatform()}.Development`;
+		mkdirSync(`${CACHE}/compiledb/${key}`, { recursive: true });
+		writeFileSync(`${CACHE}/compiledb/${key}/compile_commands.json`, JSON.stringify([{ file: `${PROJECT}/Source/Game/Private/Character/LpMoverPawn.cpp`, directory: PROJECT, command: "clang-cl.exe /c Character/LpMoverPawn.cpp" }]), "utf8");
 		const report = await compileDbReport({ cwd: PROJECT, scope: "project", fs: realFs, deps: DEPS });
 		const text = report.notes.join("\n");
 		expect(report.target).toBe("GameEditor");
@@ -474,6 +482,15 @@ utimesSync(LIVE_DB, STALE_DB, STALE_DB);
 		expect(text).toContain("DeletedPawn.cpp");
 		expect(text).toContain("rsp freshness");
 		expect(text).toContain("keep it out of git");
+	});
+
+	it("answers a report it cannot generate instead of throwing (no launcher under the engine root)", async () => {
+		const report = await compileDbReport({ cwd: PROJECT, scope: "project", fs: realFs, deps: DEPS, refresh: true });
+		expect(report.ok).toBe(false);
+		const text = report.notes.join("\n");
+		expect(text).toContain("could not generate a compile database for GameEditor");
+		expect(text).toContain("UnrealBuildTool not found under");
+		expect(text).toContain('unreal_index action "clangd" reports what it covers');
 	});
 
 	it("the clangd health action reports coverage, root cause, and the honest published:0 line", async () => {

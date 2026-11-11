@@ -1587,18 +1587,38 @@ export async function compileDbReport(input: CompileDbInput) {
 
 	const include = input.include?.length ? input.include.map(normalizePath) : compileDbScope({ projectDir: workspace.projectDir, pluginDirs: workspace.pluginDirs, engineRoot: workspace.engineRoot, scope });
 	let install: InstallResult | undefined;
-	const ensured = await ensureCompileDb({
-		engineRoot: workspace.engineRoot,
-		projectPath: workspace.projectPath,
-		target,
-		platform: input.platform,
-		configuration: input.configuration,
-		include,
-		dropHeaders: true,
-		refresh: input.refresh,
-		timeoutMs: input.timeoutMs,
-		onProgress: input.onProgress,
-	});
+	let ensured: Awaited<ReturnType<typeof ensureCompileDb>>;
+	try {
+		ensured = await ensureCompileDb({
+			engineRoot: workspace.engineRoot,
+			projectPath: workspace.projectPath,
+			target,
+			platform: input.platform,
+			configuration: input.configuration,
+			include,
+			dropHeaders: true,
+			refresh: input.refresh,
+			timeoutMs: input.timeoutMs,
+			onProgress: input.onProgress,
+		});
+	} catch (error) {
+		// A missing launcher is an answer, not a crash: the report is the one place that would
+		// otherwise take the whole tool call down (the fixture engines in the tests have no UBT, and
+		// so do source-only installs).
+		const message = error instanceof Error ? error.message : String(error);
+		return {
+			ok: false as const,
+			notes: [
+				...workspace.notes,
+				`could not generate a compile database for ${target}: ${message}`,
+				'the database clangd reads was not touched — unreal_index action "clangd" reports what it covers and whether it is current without regenerating anything',
+			],
+			warnings: [] as string[],
+			entries: 0,
+			seconds: 0,
+			reused: false,
+		};
+	}
 
 	const dbDir = ensured.path.replace(/\/compile_commands\.json$/, "");
 	const config = readClangdConfig(workspace.projectDir ?? workspace.cwd, fs);

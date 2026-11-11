@@ -75,6 +75,11 @@ the project actually loads.
   3 s, module `PhysicsControl` resolved (`includePaths: 0` — that gap is TargetDetails's, not ours).
 - `unreal_context module="PhysicsControl"` no longer claims `.uproject reference: NOT referenced` means
   "needs a reference"; a transitively enabled plugin is reported as loaded, with the chain.
+- `unreal_index action="compiledb"` answered a missing UnrealBuildTool with a thrown `Error`, so the
+  report never came back: an engine root without a launcher (source-only installs, and every test
+  fixture) now returns `ok: false` and says the database clangd reads was not touched. The acceptance
+  test for the report had been reusing a Windows-keyed cache entry left by a sibling test, so it only
+  passed on Windows — it now pre-writes the `target.platform.config` key the report asks for.
 
 ### Notes
 
